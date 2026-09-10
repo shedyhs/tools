@@ -38,6 +38,10 @@ args:
     default: "shedyhs@gmail.com"
     description: git config --global user.email dentro do sandbox
     pattern: '^[^@\s]+@[^@\s]+$'
+  dirty_guard:
+    default: "block"
+    description: Ao encerrar, o que fazer com trabalho nao commitado (KIT_DIRTY_GUARD)
+    enum: [off, warn, block]
   disabled_hooks:
     default: ""
     description: Lista separada por virgula de IDs de hook do ECC a desligar (ECC_DISABLED_HOOKS)
@@ -49,6 +53,7 @@ environment:
     ECC_DISABLED_HOOKS: "${{ kit.args.disabled_hooks }}"
     ECC_GATEGUARD: "${{ kit.args.gateguard }}"
     GITLAB_HOST: "${{ kit.args.gitlab_host }}"
+    KIT_DIRTY_GUARD: "${{ kit.args.dirty_guard }}"
 
 sandbox:
   command:
@@ -104,13 +109,22 @@ setup:
           if (!h.hooks || !Object.keys(h.hooks).length) {
             throw new Error("ECC nao instalou hooks em " + src);
           }
+          h.hooks.Stop = (h.hooks.Stop || []).concat({
+            hooks: [{
+              type: "command",
+              command: "node /home/agent/.local/bin/dirty-guard.mjs",
+              timeout: 10
+            }],
+            description: "Avisa/barra trabalho nao commitado ao encerrar",
+            id: "stop:dirty-guard"
+          });
           fs.writeFileSync(
             "/home/agent/.config/claude/ecc.json",
             JSON.stringify({ hooks: h.hooks }, null, 2)
           );
         '
       user: "1000"
-      description: Ativar os hooks do ECC pela camada --settings
+      description: Ativar hooks do ECC + dirty-guard pela camada --settings
 
     - command: "apt-get update && apt-get install -y --no-install-recommends sshpass"
       user: "0"

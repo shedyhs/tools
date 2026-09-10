@@ -76,6 +76,7 @@ worktrees, sessões paralelas) — ambos na lista.
 | `gitlab_host` | `gitlab.pm.mt.gov.br` | hostname | GitLab do glab, liberado na rede |
 | `git_user_name` | `Shedy` | texto | `git config --global user.name` |
 | `git_user_email` | `shedyhs@gmail.com` | e-mail | `git config --global user.email` |
+| `dirty_guard` | `block` | `off`, `warn`, `block` | O que fazer com trabalho não commitado ao encerrar |
 | `disabled_hooks` | *(vazio)* | IDs minúsculos por vírgula | `ECC_DISABLED_HOOKS` |
 
 Todo arg interpolado em comando tem `enum` ou `pattern` — a substituição
@@ -133,6 +134,30 @@ Editar o conteúdo é editar esse arquivo no kit. Duas coisas a lembrar:
 - O instalador do ECC também deixa um `~/.claude/AGENTS.md` (172 linhas, conteúdo
   genérico do ECC). Ele descreve o ECC, não este ambiente; se o Claude Code
   carrega AGENTS.md em escopo de usuário, não verifiquei.
+
+## Trabalho não commitado ao encerrar
+
+Num sandbox `--clone`, `git fetch sandbox-<nome>` no host traz **apenas commits**
+— arquivo não commitado morre junto com o sandbox. O kit registra um hook `Stop`
+próprio (`files/home/.local/bin/dirty-guard.mjs`) que checa o workspace e reage
+conforme o arg `dirty_guard`:
+
+| Modo | Comportamento |
+|---|---|
+| `warn` | `systemMessage` visível, não interrompe |
+| `block` (default) | `exit 2` — o Claude Code devolve a mensagem ao agente, que precisa commitar antes de encerrar |
+| `off` | desligado |
+
+Detecta duas situações: arquivos não commitados e commits locais à frente do
+upstream. Repo limpo não gera ruído. O guard entra **junto** dos hooks do ECC no
+mesmo `ecc.json` — o passo de transplante concatena a entrada `stop:dirty-guard`
+no array `Stop`.
+
+`block` respeita `stop_hook_active` para não entrar em laço infinito.
+
+O padrão é `block`: o agente é cobrado a commitar já na primeira parada com o
+repo sujo. Em trabalho exploratório isso pode incomodar — nesse caso,
+`--kit-arg dirty_guard=warn` (só avisa) ou `=off`.
 
 ## Autenticação no GitLab
 
