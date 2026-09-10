@@ -118,13 +118,20 @@ setup:
             description: "Avisa/barra trabalho nao commitado ao encerrar",
             id: "stop:dirty-guard"
           });
+          const statusLine = {
+            type: "command",
+            command: "/home/agent/.claude/statusline-command.sh",
+            padding: 0,
+            refreshInterval: 1
+          };
           fs.writeFileSync(
             "/home/agent/.config/claude/ecc.json",
-            JSON.stringify({ hooks: h.hooks }, null, 2)
+            JSON.stringify({ hooks: h.hooks, statusLine }, null, 2)
           );
+          fs.chmodSync("/home/agent/.claude/statusline-command.sh", 0o755);
         '
       user: "1000"
-      description: Ativar hooks do ECC + dirty-guard pela camada --settings
+      description: Ativar hooks, dirty-guard e statusline pela camada --settings
 
     - command: "apt-get update && apt-get install -y --no-install-recommends sshpass"
       user: "0"
