@@ -6,11 +6,32 @@ para o GitLab da PMMT.
 
 ## Uso
 
+Os defaults do kit são neutros: identidade git vazia e `gitlab.com` como host.
+Os valores da sua máquina entram na invocação — a função de shell abaixo os
+busca a cada run:
+
+```bash
+sbxecc() {
+  local host
+  host=$(git config --get remote.origin.url 2>/dev/null \
+    | sed -E 's#^[a-z]+://([^/@]*@)?([^/:]+).*#\2#; s#^[^@]+@([^:]+):.*#\1#')
+  sbx run /caminho/do/kit \
+    --kit-arg git_user_name="$(git config --global user.name)" \
+    --kit-arg git_user_email="$(git config --global user.email)" \
+    --kit-arg gitlab_host="${host:-gitlab.com}" \
+    "$@"
+}
+```
+
+`gitlab_host` sai do `origin` do repositório onde você está. Sem identidade, o
+`setup.install` avisa em stderr que `git commit` vai falhar — e segue, porque
+nem todo uso precisa commitar.
+
 Setup uma vez (token fica no host; o container só vê um placeholder):
 
 ```bash
-sbx secret set-custom --host gitlab.pm.mt.gov.br --env GITLAB_TOKEN \
-  --value "$(glab config get token --host gitlab.pm.mt.gov.br)"
+sbx secret set-custom --host gitlab.example.com --env GITLAB_TOKEN \
+  --value "$(glab config get token --host gitlab.example.com)"
 ```
 
 Depois, todo sandbox sobe autenticado:
@@ -73,10 +94,11 @@ worktrees, sessões paralelas) — ambos na lista.
 | `hook_profile` | `standard` | `minimal`, `standard`, `strict` | `ECC_HOOK_PROFILE` |
 | `gateguard` | `on` | `on`, `off` | `ECC_GATEGUARD` |
 | `glab_version` | `1.117.0` | `X.Y.Z` | Versão do GitLab CLI |
-| `gitlab_host` | `gitlab.pm.mt.gov.br` | hostname | GitLab do glab, liberado na rede |
-| `git_user_name` | `Shedy` | texto | `git config --global user.name` |
-| `git_user_email` | `shedyhs@gmail.com` | e-mail | `git config --global user.email` |
+| `gitlab_host` | `gitlab.com` | hostname | GitLab do glab, liberado na rede |
+| `git_user_name` | *(vazio)* | texto | `git config --global user.name` |
+| `git_user_email` | *(vazio)* | e-mail | `git config --global user.email` |
 | `dirty_guard` | `block` | `off`, `warn`, `block` | O que fazer com trabalho não commitado ao encerrar |
+| `copy_from_host` | *(vazio)* | lista por vírgula | Arquivos ignorados pelo git a copiar do repo do host (só com `--clone`) |
 | `disabled_hooks` | *(vazio)* | IDs minúsculos por vírgula | `ECC_DISABLED_HOOKS` |
 
 Todo arg interpolado em comando tem `enum` ou `pattern` — a substituição
@@ -135,6 +157,31 @@ Editar o conteúdo é editar esse arquivo no kit. Duas coisas a lembrar:
   genérico do ECC). Ele descreve o ECC, não este ambiente; se o Claude Code
   carrega AGENTS.md em escopo de usuário, não verifiquei.
 
+## Arquivos ignorados pelo git (.env, certs)
+
+Com `--clone`, o clone só tem o que está versionado — `.env` e afins ficam de
+fora. Mas o repo do host fica montado **read-only em `/run/sandbox/source`**
+dentro do container, então o kit consegue buscar de lá:
+
+```bash
+sbxecc --clone --kit-arg copy_from_host=.env,certs .
+```
+
+Default vazio: **nada é copiado sem pedido explícito**. A cópia roda no
+`setup.startup`, nunca sobrescreve arquivo já existente no workspace, e avisa no
+log o que copiou, o que não achou e o que manteve. Sem `--clone` o mount não
+existe e o passo não faz nada (o bind mount já traz tudo).
+
+Como esses arquivos são ignorados pelo git, eles **não voltam** para o host num
+`git fetch sandbox-<nome>` — verificado: `git status` limpo depois da cópia.
+
+⚠️ Isso move segredo para dentro de um sandbox onde o agente roda com
+`--dangerously-skip-permissions`. Prefira credenciais de dev; para rodar testes,
+veja antes se um `.env.test` versionado já resolve.
+
+Ressalva: `setup.startup` não segura o entrypoint — o agente pode subir uma
+fração de segundo antes do arquivo aterrissar.
+
 ## Trabalho não commitado ao encerrar
 
 Num sandbox `--clone`, `git fetch sandbox-<nome>` no host traz **apenas commits**
@@ -175,7 +222,7 @@ repo sujo. Em trabalho exploratório isso pode incomodar — nesse caso,
   Basic). O custom secret não tem esse problema.
 
 Alternativa com o token dentro do container:
-`-e GITLAB_TOKEN="$(glab config get token --host gitlab.pm.mt.gov.br)"`.
+`-e GITLAB_TOKEN="$(glab config get token --host gitlab.example.com)"`.
 
 ## Rede
 
@@ -183,7 +230,7 @@ Alternativa com o token dentro do container:
 allow:
   - "github.com:443"           # clone do ECC
   - "gitlab.com:443"           # release do glab
-  - "gitlab.pm.mt.gov.br:443"  # GitLab de trabalho (arg gitlab_host)
+  - "gitlab.example.com:443"  # GitLab de trabalho (arg gitlab_host)
 ```
 
 `github.com:443` basta para o clone (testado sem `codeload` e
@@ -222,9 +269,9 @@ Sandbox criado do zero, `sbx v0.42.1`:
 - **hook executa**: o dispatcher devolveu `permissionDecision: deny` para
   `npm run dev` com `gateguard=on`;
 - **nenhum plugin instalado** (`claude plugin list` sem `ecc@ecc`);
-- **commit funciona**: `git commit` assinou como `Shedy <shedyhs@gmail.com>`;
+- **commit funciona**: `git commit` assinou como a identidade passada por `--kit-arg`;
 - **credencial injetada no startup**: sandbox novo sobe com
-  `GITLAB_TOKEN=sbx-cs-…`, `glab auth status` loga como `shedyhs` e
+  `GITLAB_TOKEN=sbx-cs-…`, `glab auth status` loga com o usuario do token e
   `git ls-remote` num repo real da PMMT retorna os refs, sem `-e`. O `push` usa
   o mesmo header Basic (auth verificada na leitura; escrita não testada contra
   produção);

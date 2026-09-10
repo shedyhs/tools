@@ -27,21 +27,25 @@ args:
     description: Versao do GitLab CLI (glab) instalada
     pattern: '^[0-9]+\.[0-9]+\.[0-9]+$'
   gitlab_host:
-    default: "gitlab.pm.mt.gov.br"
+    default: "gitlab.com"
     description: Instancia GitLab usada pelo glab e liberada na rede
     pattern: '^[a-z0-9][a-z0-9.-]*$'
   git_user_name:
-    default: "Shedy"
-    description: git config --global user.name dentro do sandbox
-    pattern: '^[^\n]{1,64}$'
+    default: ""
+    description: git config --global user.name (vazio = passe via --kit-arg)
+    pattern: '^[^\n]{0,64}$'
   git_user_email:
-    default: "shedyhs@gmail.com"
-    description: git config --global user.email dentro do sandbox
-    pattern: '^[^@\s]+@[^@\s]+$'
+    default: ""
+    description: git config --global user.email (vazio = passe via --kit-arg)
+    pattern: '^([^@\s]+@[^@\s]+)?$'
   dirty_guard:
     default: "block"
     description: Ao encerrar, o que fazer com trabalho nao commitado (KIT_DIRTY_GUARD)
     enum: [off, warn, block]
+  copy_from_host:
+    default: ""
+    description: Arquivos ignorados pelo git a copiar do repo do host para o workspace (so com --clone). Ex, .env,certs
+    pattern: '([^,[:space:]]+(,[^,[:space:]]+)*)?'
   disabled_hooks:
     default: ""
     description: Lista separada por virgula de IDs de hook do ECC a desligar (ECC_DISABLED_HOOKS)
@@ -54,6 +58,7 @@ environment:
     ECC_GATEGUARD: "${{ kit.args.gateguard }}"
     GITLAB_HOST: "${{ kit.args.gitlab_host }}"
     KIT_DIRTY_GUARD: "${{ kit.args.dirty_guard }}"
+    KIT_COPY_FROM_HOST: "${{ kit.args.copy_from_host }}"
 
 sandbox:
   command:
@@ -166,9 +171,52 @@ setup:
     - command: |
         set -eu
         HOST="${{ kit.args.gitlab_host }}"
-        git config --global user.name "${{ kit.args.git_user_name }}"
-        git config --global user.email "${{ kit.args.git_user_email }}"
+        NOME="${{ kit.args.git_user_name }}"
+        EMAIL="${{ kit.args.git_user_email }}"
+        if [ -n "$NOME" ] && [ -n "$EMAIL" ]; then
+          git config --global user.name "$NOME"
+          git config --global user.email "$EMAIL"
+        else
+          echo "AVISO: identidade git nao configurada (git_user_name/git_user_email vazios)." >&2
+          echo "       git commit vai falhar dentro deste sandbox." >&2
+          echo "       Passe --kit-arg git_user_name=... --kit-arg git_user_email=..." >&2
+        fi
         git config --global "credential.https://${HOST}.helper" "!glab auth git-credential"
         glab config set --host "$HOST" git_protocol https
       user: "1000"
       description: Identidade git e glab apontando para o GitLab de trabalho
+
+  files:
+    - path: /home/agent/.local/bin/copy-from-host.sh
+      mode: "0755"
+      description: Copia arquivos ignorados pelo git do repo do host para o clone
+      content: |
+        #!/bin/sh
+        # Com --clone, o repo do host fica read-only em /run/sandbox/source.
+        # Copia dali o que o git ignora (.env, certs) e por isso nao veio no clone.
+        # Nunca sobrescreve arquivo ja existente no workspace.
+        set -eu
+        SRC=/run/sandbox/source
+        WS="${WORKDIR}"
+        [ -n "$KIT_COPY_FROM_HOST" ] || exit 0
+        if [ ! -d "$SRC" ]; then
+          echo "[copy-from-host] $SRC ausente (sandbox sem --clone); nada a fazer"
+          exit 0
+        fi
+        IFS=,
+        for item in $KIT_COPY_FROM_HOST; do
+          [ -n "$item" ] || continue
+          if [ ! -e "$SRC/$item" ]; then
+            echo "[copy-from-host] nao existe no host: $item"
+          elif [ -e "$WS/$item" ]; then
+            echo "[copy-from-host] ja existe no workspace, mantido: $item"
+          else
+            cp -a "$SRC/$item" "$WS/$item"
+            echo "[copy-from-host] copiado: $item"
+          fi
+        done
+
+  startup:
+    - command: ["/home/agent/.local/bin/copy-from-host.sh"]
+      user: "1000"
+      description: Copiar arquivos ignorados pelo git, se copy_from_host pedir
