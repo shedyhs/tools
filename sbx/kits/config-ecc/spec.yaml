@@ -1,0 +1,140 @@
+schemaVersion: "2"
+kind: sandbox
+name: config-ecc
+version: "0.1.0"
+displayName: Claude Code + ECC seletivo + glab
+description: Claude Code com ECC seletivo (skills curadas, agentes, comandos e rules), hooks do ECC ativos e glab configurado
+extends: claude
+sourceURL: https://github.com/affaan-m/ECC
+licenses:
+  - MIT
+
+args:
+  ecc_ref:
+    default: "v2.1.0"
+    description: Tag do repositorio ECC clonada no sandbox
+    pattern: '^v[0-9]+\.[0-9]+\.[0-9]+$'
+  hook_profile:
+    default: "standard"
+    description: Rigor dos hooks do ECC (ECC_HOOK_PROFILE)
+    enum: [minimal, standard, strict]
+  gateguard:
+    default: "on"
+    description: GateGuard (ECC_GATEGUARD) - exige fatos antes de comandos sensiveis
+    enum: [on, off]
+  glab_version:
+    default: "1.117.0"
+    description: Versao do GitLab CLI (glab) instalada
+    pattern: '^[0-9]+\.[0-9]+\.[0-9]+$'
+  gitlab_host:
+    default: "gitlab.pm.mt.gov.br"
+    description: Instancia GitLab usada pelo glab e liberada na rede
+    pattern: '^[a-z0-9][a-z0-9.-]*$'
+  git_user_name:
+    default: "Shedy"
+    description: git config --global user.name dentro do sandbox
+    pattern: '^[^\n]{1,64}$'
+  git_user_email:
+    default: "shedyhs@gmail.com"
+    description: git config --global user.email dentro do sandbox
+    pattern: '^[^@\s]+@[^@\s]+$'
+  disabled_hooks:
+    default: ""
+    description: Lista separada por virgula de IDs de hook do ECC a desligar (ECC_DISABLED_HOOKS)
+    pattern: '([a-z0-9][a-z0-9:_-]*(,[a-z0-9][a-z0-9:_-]*)*)?' 
+
+environment:
+  variables:
+    ECC_HOOK_PROFILE: "${{ kit.args.hook_profile }}"
+    ECC_DISABLED_HOOKS: "${{ kit.args.disabled_hooks }}"
+    ECC_GATEGUARD: "${{ kit.args.gateguard }}"
+    GITLAB_HOST: "${{ kit.args.gitlab_host }}"
+
+sandbox:
+  command:
+    - --dangerously-skip-permissions
+    - --settings
+    - /home/agent/.config/claude/ecc.json
+
+permissions:
+  network:
+    allow:
+      - "github.com:443"                       # clone do ECC
+      - "gitlab.com:443"                       # release do glab
+      - "${{ kit.args.gitlab_host }}:443"      # GitLab de trabalho
+
+setup:
+  install:
+    - command: 'command -v git >/dev/null 2>&1 || { echo "ERRO: git ausente na imagem base do agente claude" >&2; exit 1; }'
+      user: "1000"
+      description: Exigir git na imagem base
+
+    - command: |
+        set -eu
+        DEST=/home/agent/.ecc/ECC
+        STAMP=/home/agent/.ecc/installed-ref
+        REF="${{ kit.args.ecc_ref }}"
+        mkdir -p /home/agent/.ecc
+        if [ -d "$DEST/.git" ] && [ -f "$STAMP" ] && [ "$(cut -d" " -f1 "$STAMP")" = "$REF" ]; then
+          exit 0
+        fi
+        rm -rf "$DEST"
+        git clone --depth 1 --branch "$REF" https://github.com/affaan-m/ECC.git "$DEST"
+        printf "%s %s\n" "$REF" "$(git -C "$DEST" rev-parse HEAD)" > "$STAMP"
+      user: "1000"
+      description: Clonar ECC na tag fixada
+
+    - command: |
+        set -eu
+        SK=$(tr -d "[:space:]" < /home/agent/.ecc-skills)
+        node /home/agent/.ecc/ECC/scripts/install-apply.js \
+          --target claude --modules hooks-runtime --skills "$SK"
+      user: "1000"
+      description: Instalar ECC seletivo (skills da lista + hooks runtime)
+
+    - command: |
+        set -eu
+        mkdir -p /home/agent/.config/claude
+        node -e '
+          const fs = require("fs");
+          const src = "/home/agent/.claude/hooks/hooks.json";
+          const h = JSON.parse(fs.readFileSync(src, "utf8"));
+          if (!h.hooks || !Object.keys(h.hooks).length) {
+            throw new Error("ECC nao instalou hooks em " + src);
+          }
+          fs.writeFileSync(
+            "/home/agent/.config/claude/ecc.json",
+            JSON.stringify({ hooks: h.hooks }, null, 2)
+          );
+        '
+      user: "1000"
+      description: Ativar os hooks do ECC pela camada --settings
+
+    - command: |
+        set -eu
+        V="${{ kit.args.glab_version }}"
+        VE=$(echo "$V" | sed "s/\./%2E/g")
+        BASE="https://gitlab.com/api/v4/projects/gitlab-org%2Fcli/packages/generic/glab/${VE}"
+        case "$(uname -m)" in
+          x86_64) A=amd64 ;;
+          aarch64) A=arm64 ;;
+          *) echo "ERRO: arquitetura $(uname -m) sem binario glab" >&2; exit 1 ;;
+        esac
+        cd /tmp
+        curl -fsSL "${BASE}/glab_${VE}_linux_${A}%2Etar%2Egz" -o glab.tgz
+        curl -fsSL "${BASE}/checksums%2Etxt" -o glab-sums.txt
+        grep "glab_${V}_linux_${A}.tar.gz" glab-sums.txt | sed "s|glab_.*|glab.tgz|" | sha256sum -c -
+        tar -xzf glab.tgz -C /tmp bin/glab
+        install -m 0755 /tmp/bin/glab /usr/local/bin/glab
+      user: "0"
+      description: Instalar o glab com checksum conferido
+
+    - command: |
+        set -eu
+        HOST="${{ kit.args.gitlab_host }}"
+        git config --global user.name "${{ kit.args.git_user_name }}"
+        git config --global user.email "${{ kit.args.git_user_email }}"
+        git config --global "credential.https://${HOST}.helper" "!glab auth git-credential"
+        glab config set --host "$HOST" git_protocol https
+      user: "1000"
+      description: Identidade git e glab apontando para o GitLab de trabalho
