@@ -61,6 +61,8 @@ permissions:
     allow:
       - "github.com:443"                       # clone do ECC
       - "gitlab.com:443"                       # release do glab
+      - "registry.npmjs.org:443"               # deps da skill qrcode-otp
+      - "*.npmjs.org:443"
       - "${{ kit.args.gitlab_host }}:443"      # GitLab de trabalho
 
 setup:
@@ -109,6 +111,17 @@ setup:
         '
       user: "1000"
       description: Ativar os hooks do ECC pela camada --settings
+
+    - command: "apt-get update && apt-get install -y --no-install-recommends sshpass"
+      user: "0"
+      description: Instalar sshpass (skill ssh-remote)
+
+    - command: |
+        set -eu
+        cd /home/agent/.claude/skills/qrcode-otp/scripts
+        npm install --omit=dev --no-audit --no-fund --loglevel=error
+      user: "1000"
+      description: Dependencias da skill qrcode-otp
 
     - command: |
         set -eu
