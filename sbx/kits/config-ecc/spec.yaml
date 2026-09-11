@@ -72,6 +72,7 @@ permissions:
       - "github.com:443"                       # clone do ECC
       - "gitlab.com:443"                       # release do glab
       - "registry.npmjs.org:443"               # deps da skill qrcode-otp
+      - "deb.debian.org:443"                   # update do debian quando levanta o container
       - "*.npmjs.org:443"
       - "${{ kit.args.gitlab_host }}:443"      # GitLab de trabalho
 
