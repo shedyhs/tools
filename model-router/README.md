@@ -20,9 +20,10 @@ Claude Code -> headroom (:8787) -> claude-model-router (:8788) -> api.anthropic.
 
 Requisitos: [uv](https://docs.astral.sh/uv/), systemd de usuário e o headroom rodando como o serviço `headroom-default`.
 
-1. Copie o script:
+1. Copie o script e o lockfile, que fixa as versões e os hashes das dependências:
    ```sh
    install -m 755 claude-model-router ~/.local/bin/
+   install -m 644 claude-model-router.lock ~/.local/bin/
    ```
 2. Crie o arquivo de ambiente e coloque a sua chave da TypeSafe nele:
    ```sh
@@ -51,6 +52,8 @@ O `ANTHROPIC_BASE_URL` do Claude Code continua apontando para o headroom (`http:
 | `ROUTER_CONFIDENCE_MIN` | `0.5` | Confiança mínima do Jev. Abaixo dela, o roteador usa Opus e `high`. |
 | `ROUTER_PORT` | `8788` | Porta local do roteador. |
 | `ROUTER_UPSTREAM` | `https://api.anthropic.com` | Destino das requisições. |
+| `ROUTER_LOG_FILE` | (nenhum) | Também grava o log neste arquivo, com data e hora. Sem journald, o `--stats` lê daqui. |
+| `HTTPS_PROXY` | (nenhum) | Proxy de saída para a Anthropic e a TypeSafe, como o do Docker Sandbox. |
 
 ## Comandos
 
@@ -59,11 +62,20 @@ claude-model-router --selftest            # testa a lógica de roteamento
 claude-model-router --stats [since]       # resumo em texto (padrão: today)
 claude-model-router --stats-json today    # o mesmo resumo em JSON
 journalctl --user -u claude-model-router  # logs, uma linha `route {...}` por turno
+curl http://127.0.0.1:8788/_router/health # "ok" se o roteador está de pé (sem chamar a Anthropic)
 ```
+
+Sem journald (num sandbox, por exemplo), o `--stats` lê o `ROUTER_LOG_FILE` e só
+aceita `today` ou uma data `AAAA-MM-DD [HH:MM]`.
 
 ## Painel
 
 A pasta [`router-view/`](router-view/) tem um mod do Claude Code. O comando `/router` abre um painel lateral com os turnos por modelo, o esforço, os fallbacks e os agentes ativos.
+
+## No Docker Sandbox
+
+O kit [`sbx/kits/config-ecc`](../sbx/kits/config-ecc/) traz o roteador e o
+painel. Veja a seção "Roteador de modelos" do README do kit.
 
 ## Desligar
 

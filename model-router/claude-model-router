@@ -24,11 +24,15 @@ import gzip
 import hashlib
 import json
 import logging
+import logging.handlers
 import os
 import re
+import shutil
+import subprocess
 import sys
 import time
 from collections import OrderedDict
+from datetime import datetime
 
 import aiohttp
 from aiohttp import web
@@ -40,6 +44,16 @@ PORT = int(os.environ.get("ROUTER_PORT", "8788"))
 CONFIDENCE_MIN = float(os.environ.get("ROUTER_CONFIDENCE_MIN", "0.5"))
 TYPESAFE_URL = "https://api.typesafe.ai/v1/systemone"
 TYPESAFE_TIMEOUT_S = 5
+# Outbound proxy. A Docker sandbox sends all HTTPS through one. A normal host has none.
+PROXY = os.environ.get("HTTPS_PROXY") or os.environ.get("https_proxy") or None
+# A sandbox has no journald. If ROUTER_LOG_FILE is set, the router also logs to
+# that file, and `--stats` reads the file.
+LOG_FILE = os.environ.get("ROUTER_LOG_FILE")
+STATS_LOG_FILE = LOG_FILE or os.path.expanduser(
+    "~/.local/state/claude-model-router/router.log")
+LOG_FILE_MAX_BYTES = 5 * 1024 * 1024
+HEALTH_PATH = "/_router/health"
+LOG_TIME_FORMAT = "%Y-%m-%dT%H:%M:%S"
 STATE_MAX_CHARS = 1500
 STICKY_MAX = 1000
 PROMPT_LOG_CHARS = 100
@@ -94,6 +108,7 @@ INJECTED_PREFIXES = ("<system-reminder>", "<command-", "<local-command",
 # ponytail: common secret shapes only. Extend if a new key format leaks.
 SECRET_RE = re.compile(
     r"sk-[A-Za-z0-9_-]{20,}|AKIA[0-9A-Z]{16}|gh[pousr]_[A-Za-z0-9]{20,}"
+    r"|glpat-[\w-]{20,}|xox[abposr]-\S+|eyJ[\w-]+\.[\w-]+\.[\w-]+"
     r"|-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z ]*PRIVATE KEY-----"
     r"|Bearer\s+\S{20,}|\b\w*(?:KEY|TOKEN|SECRET|PASSWORD)\w*\s*[=:]\s*\S+",
     re.IGNORECASE)
@@ -183,6 +198,7 @@ async def classify(session, api_key, text):
             headers={"Authorization": f"Bearer {api_key}",
                      "Accept-Encoding": "identity"},
             timeout=aiohttp.ClientTimeout(total=TYPESAFE_TIMEOUT_S),
+            proxy=PROXY,
         ) as resp:
             resp.raise_for_status()
             answers = (await resp.json())["answers"]
@@ -290,6 +306,8 @@ async def proxy(request):
     # Block browsers (DNS rebinding, cross-site POST). Claude Code sends no Origin.
     if request.host not in ALLOWED_HOSTS or "Origin" in request.headers:
         raise web.HTTPForbidden()
+    if request.method == "GET" and request.path == HEALTH_PATH:
+        return web.Response(text="ok")  # No upstream call: only "is it up?".
 
     app = request.app
     body = await request.read()
@@ -312,7 +330,7 @@ async def proxy(request):
     try:
         upstream = await session.request(request.method, url, headers=headers,
                                          data=routed or body,
-                                         allow_redirects=False)
+                                         allow_redirects=False, proxy=PROXY)
         if routed and upstream.status == 400:
             # The routed model rejected a parameter (for example a beta
             # header). Send the original request, and stop routing this turn.
@@ -324,7 +342,8 @@ async def proxy(request):
             app["sticky"].pop(key, None)
             upstream = await session.request(request.method, url,
                                              headers=headers, data=body,
-                                             allow_redirects=False)
+                                             allow_redirects=False,
+                                             proxy=PROXY)
     except aiohttp.ClientError as exc:
         log.warning("upstream_error type=%s", type(exc).__name__)
         return bad_gateway()
@@ -354,9 +373,28 @@ async def on_cleanup(app):
     await app["session"].close()
 
 
+def add_log_file(path):
+    """Also log to a file, with a timestamp, for `--stats` where there is no
+    journald. The folder is private: log lines hold the head of each prompt."""
+    os.umask(0o077)  # Also for the new file after each rotation.
+    os.makedirs(os.path.dirname(path), mode=0o700, exist_ok=True)
+    handler = logging.handlers.RotatingFileHandler(
+        path, maxBytes=LOG_FILE_MAX_BYTES, backupCount=1, encoding="utf-8")
+    os.chmod(path, 0o600)
+    handler.setFormatter(logging.Formatter(
+        "%(asctime)s\t%(levelname)s %(name)s %(message)s", LOG_TIME_FORMAT))
+    logging.getLogger().addHandler(handler)
+
+
 def main():
     logging.basicConfig(level=logging.INFO,
                         format="%(levelname)s %(name)s %(message)s")
+    if LOG_FILE:
+        # Route lines (with prompt heads) go only to the rotated file. stderr
+        # keeps warnings and errors, so its file stays small.
+        for handler in logging.getLogger().handlers:
+            handler.setLevel(logging.WARNING)
+        add_log_file(LOG_FILE)
     api_key = os.environ.get("TYPESAFE_API_KEY")
     if not api_key:
         sys.exit("TYPESAFE_API_KEY is not set.")
@@ -379,27 +417,68 @@ def parse_route(message):
         return None
 
 
-def summarize(since):
-    """Read the route lines from journald since `since` and count them."""
-    import subprocess
-    from collections import Counter
-    from datetime import datetime
+def since_epoch(since):
+    """Seconds since the epoch for 'today' or 'YYYY-MM-DD[ HH:MM[:SS]]', local time."""
+    now = datetime.now()
+    if since == "today":
+        return datetime(now.year, now.month, now.day).timestamp()
+    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M", "%Y-%m-%d"):
+        try:
+            return datetime.strptime(since, fmt).timestamp()
+        except ValueError:
+            pass
+    raise SystemExit(f"Sem journald, --since aceita 'today' ou 'AAAA-MM-DD [HH:MM]': {since!r}")
+
+
+def read_log_file(path, since):
+    """Return (epoch, message) pairs from the log file since `since`. The
+    rotated file (`.1`) comes first, because it holds the older lines."""
+    cutoff, entries = since_epoch(since), []
+    for name in (path + ".1", path):
+        if not os.path.exists(name):
+            continue
+        with open(name, encoding="utf-8", errors="replace") as f:
+            for line in f:
+                stamp, _, msg = line.rstrip("\n").partition("\t")
+                try:
+                    epoch = datetime.strptime(stamp, LOG_TIME_FORMAT).timestamp()
+                except ValueError:
+                    continue  # A line of a traceback has no timestamp.
+                if epoch >= cutoff:
+                    entries.append((epoch, msg))
+    return entries
+
+
+def read_entries(since):
+    """Return (epoch, message) pairs: from the log file if there is one, else
+    from journald, else nothing."""
+    if os.path.exists(STATS_LOG_FILE):
+        return read_log_file(STATS_LOG_FILE, since)
+    if not shutil.which("journalctl"):
+        return []
     out = subprocess.run(
         ["journalctl", "--user", "-u", "claude-model-router", "-o", "json",
          "--no-pager", "--since", since],
         capture_output=True, text=True, check=True).stdout
-    routes, rejects = [], 0
+    entries = []
     for line in out.splitlines():
         entry = json.loads(line)
-        msg = entry.get("MESSAGE")
-        if not isinstance(msg, str):
-            continue
+        if isinstance(entry.get("MESSAGE"), str):
+            entries.append((int(entry["__REALTIME_TIMESTAMP"]) / 1e6,
+                            entry["MESSAGE"]))
+    return entries
+
+
+def summarize(since):
+    """Read the route lines since `since` and count them."""
+    from collections import Counter
+    routes, rejects = [], 0
+    for epoch, msg in read_entries(since):
         msg = msg.split("model-router ", 1)[-1]
         if msg.startswith("routed_400"):
             rejects += 1
         elif (r := parse_route(msg)) is not None:
-            r["ts"] = datetime.fromtimestamp(
-                int(entry["__REALTIME_TIMESTAMP"]) / 1e6).strftime("%d/%m %H:%M")
+            r["ts"] = datetime.fromtimestamp(epoch).strftime("%d/%m %H:%M")
             routes.append(r)
     final = Counter(r["tier"] for r in routes)
     jev = Counter(r["jev"] for r in routes if r.get("jev"))
@@ -480,6 +559,9 @@ def selftest():
     secret = user_text({"content": "use sk-ant-abcdefghijklmnopqrstuvwxyz "
                                    "and API_KEY=hunter2"})
     assert "sk-ant" not in secret and "hunter2" not in secret, secret
+    tokens = user_text({"content": "glpat-abcdefghijklmnopqrstu xoxb-123-abc "
+                                   "eyJhbGciOi.eyJzdWIiOiIx.c2lnbmF0dXJl ok"})
+    assert tokens == "[redacted] [redacted] [redacted] ok", tokens
     assert conversation_key([prompt]) == conversation_key([cached, tool_result])
     assert conversation_key([prompt]) != conversation_key([tool_result])
     assert conversation_key([prompt], "s1") != conversation_key([prompt], "s2")
@@ -505,7 +587,43 @@ def selftest():
     assert parse_route("route conv=abc tier=opus") is None
     assert parse_route("typesafe_error type=X") is None
     selftest_route(prompt, tool_result)
+    selftest_log_file()
     print("selftest OK")
+
+
+def selftest_log_file():
+    """Check that `--stats` reads the log file, and only the lines from today."""
+    import tempfile
+    assert since_epoch("today") <= time.time()
+    assert since_epoch("2020-01-02") < since_epoch("2020-01-02 10:30")
+    # A fixed day, so the test does not depend on the clock (midnight).
+    stamp, day = "2030-05-06T12:00:00", "2030-05-06"
+    route = json.dumps({"tier": "haiku", "jev": "haiku", "confidence": 0.9,
+                        "effort": "low", "effort_default": False, "ms": 300})
+    lines = [f"2020-01-02T10:00:00\tINFO model-router route {route}",
+             f"{stamp}\tINFO model-router route {route}",
+             f"{stamp}\tWARNING model-router routed_400 conv=x",
+             "Traceback (most recent call last):"]
+    with tempfile.TemporaryDirectory() as tmp:
+        path = os.path.join(tmp, "router.log")
+        with open(path, "w", encoding="utf-8") as f:
+            f.write("\n".join(lines) + "\n")
+        today = read_log_file(path, day)
+        assert len(today) == 2, today
+        assert len(read_log_file(path, "2020-01-01")) == 3
+        # After a rotation, the older lines are in `.1` and still count.
+        os.rename(path, path + ".1")
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(f"{stamp}\tINFO model-router route {route}\n")
+        assert len(read_log_file(path, day)) == 3
+        global STATS_LOG_FILE
+        saved, STATS_LOG_FILE = STATS_LOG_FILE, path
+        try:
+            s = summarize(day)
+        finally:
+            STATS_LOG_FILE = saved
+        assert s["total"] == 2 and s["rejects"] == 1, s
+        assert s["final"]["haiku"] == 2 and s["effort"]["low"] == 2, s
 
 
 def selftest_route(prompt, tool_result):
