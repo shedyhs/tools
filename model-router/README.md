@@ -1,6 +1,6 @@
 # claude-model-router
 
-Proxy local que escolhe o modelo de cada turno do Claude Code. A cada nova mensagem do usuário, o roteador pergunta ao Jev (TypeSafe) se o turno precisa de Haiku, Sonnet ou Opus.
+Proxy local que escolhe o modelo e o esforço (effort) de cada turno do Claude Code. A cada nova mensagem do usuário, o roteador pergunta ao Jev (TypeSafe) se o turno precisa de Haiku, Sonnet ou Opus, e qual esforço usar: `low`, `medium`, `high`, `xhigh` ou `max`.
 
 ```
 Claude Code -> headroom (:8787) -> claude-model-router (:8788) -> api.anthropic.com
@@ -10,7 +10,9 @@ Claude Code -> headroom (:8787) -> claude-model-router (:8788) -> api.anthropic.
 
 - O roteador só muda o modelo do loop principal (requisições com `thinking.type == "adaptive"`). Chamadas auxiliares e pedidos de Haiku passam sem mudança.
 - Se o Jev responde com confiança abaixo de `ROUTER_CONFIDENCE_MIN`, o roteador usa Opus. Se a TypeSafe falha ou demora mais de 5 s, o roteador também usa Opus.
-- O modelo escolhido fica fixo até o fim do turno, porque o cache de prompt é por modelo.
+- O esforço vai em `output_config.effort`. O roteador mantém as outras chaves de `output_config`. Se a confiança do Jev no esforço fica abaixo de `ROUTER_CONFIDENCE_MIN`, ou se a TypeSafe falha, o roteador usa `high`.
+- As duas perguntas vão na mesma chamada à TypeSafe.
+- O modelo e o esforço escolhidos ficam fixos até o fim do turno, porque o cache de prompt é por modelo.
 - O texto enviado ao Jev tem no máximo 1500 caracteres. O roteador mascara chaves e segredos antes de enviar.
 - O roteador fica depois do headroom. Na ordem inversa, o headroom não reconhece `claude-haiku-5`, move as system messages para o topo e a Anthropic responde 400.
 
@@ -46,7 +48,7 @@ O `ANTHROPIC_BASE_URL` do Claude Code continua apontando para o headroom (`http:
 | Variável | Padrão | Uso |
 | --- | --- | --- |
 | `TYPESAFE_API_KEY` | (nenhum) | Chave da TypeSafe. Obrigatória: sem ela, o roteador não inicia. |
-| `ROUTER_CONFIDENCE_MIN` | `0.5` | Confiança mínima do Jev. Abaixo dela, o roteador usa Opus. |
+| `ROUTER_CONFIDENCE_MIN` | `0.5` | Confiança mínima do Jev. Abaixo dela, o roteador usa Opus e `high`. |
 | `ROUTER_PORT` | `8788` | Porta local do roteador. |
 | `ROUTER_UPSTREAM` | `https://api.anthropic.com` | Destino das requisições. |
 

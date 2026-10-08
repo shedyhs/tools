@@ -52,6 +52,8 @@ MODELS = {
     "opus": "claude-opus-5-5",
 }
 FALLBACK_TIER = "opus"
+# Effort used when Jev is not sure, or TypeSafe fails.
+FALLBACK_EFFORT = "high"
 
 CRITERIA = {
     "haiku": "Trivial: a quick question, a lookup, a rename, formatting, "
@@ -67,9 +69,28 @@ INSTRUCTIONS = (
     "model tier that can do the request correctly."
 )
 
+# Valid values of output_config.effort. Jev picks one for each new turn.
+EFFORT_CRITERIA = {
+    "low": "Little reasoning: a lookup, a rename, formatting, a one-line "
+    "edit, or a short answer.",
+    "medium": "Some reasoning: a clear change in one or two files, or an "
+    "explanation of known code.",
+    "high": "Careful reasoning: a feature in several files, debugging an "
+    "error, or writing tests.",
+    "xhigh": "Deep reasoning: a hard bug, a refactor across many files, or "
+    "a design trade-off.",
+    "max": "Maximum reasoning: ambiguous or high-risk work, or research, "
+    "where a mistake is costly.",
+}
+EFFORT_INSTRUCTIONS = (
+    "A developer sent this request to a coding agent. Select the lowest "
+    "reasoning effort that can do the request correctly."
+)
+
 # Text that Claude Code injects as a user message. It is not a new request.
 INJECTED_PREFIXES = ("<system-reminder>", "<command-", "<local-command",
-                     "This session is being continued", "[Request interrupted")
+                     "This session is being continued", "[Request interrupted",
+                     "[SUGGESTION MODE")
 # ponytail: common secret shapes only. Extend if a new key format leaks.
 SECRET_RE = re.compile(
     r"sk-[A-Za-z0-9_-]{20,}|AKIA[0-9A-Z]{16}|gh[pousr]_[A-Za-z0-9]{20,}"
@@ -134,14 +155,27 @@ def pick_tier(choice, confidence):
     return choice
 
 
+def pick_effort(choice, confidence):
+    """Return the effort, or None when Jev is not sure."""
+    if not isinstance(choice, str) or choice not in EFFORT_CRITERIA:
+        return None
+    if not isinstance(confidence, (int, float)) or not confidence >= CONFIDENCE_MIN:
+        return None
+    return choice
+
+
 async def classify(session, api_key, text):
-    """Return (tier, Jev answer). The answer is None if TypeSafe failed."""
+    """Return (tier, effort, Jev answers). The answers are {} if TypeSafe
+    failed, and the effort is then None."""
     payload = {
         "model": "jev-latest",
         "state": {"request": text},
         "questions": {"tier": {"type": "choice",
                                "instructions": INSTRUCTIONS,
-                               "criteria": CRITERIA}},
+                               "criteria": CRITERIA},
+                      "effort": {"type": "choice",
+                                 "instructions": EFFORT_INSTRUCTIONS,
+                                 "criteria": EFFORT_CRITERIA}},
     }
     try:
         async with session.post(
@@ -151,7 +185,8 @@ async def classify(session, api_key, text):
             timeout=aiohttp.ClientTimeout(total=TYPESAFE_TIMEOUT_S),
         ) as resp:
             resp.raise_for_status()
-            answer = (await resp.json())["answers"]["tier"]
+            answers = (await resp.json())["answers"]
+        answer = answers["tier"]
         choice, confidence = answer["choice"], float(answer["confidence"])
     except (aiohttp.ClientError, asyncio.TimeoutError, KeyError,
             TypeError, ValueError) as exc:
@@ -160,8 +195,14 @@ async def classify(session, api_key, text):
         log.warning("typesafe_error type=%s status=%s fallback=%s",
                     type(exc).__name__, getattr(exc, "status", "-"),
                     FALLBACK_TIER)
-        return FALLBACK_TIER, None
-    return pick_tier(choice, confidence), answer
+        return FALLBACK_TIER, None, {}
+    # A bad effort answer must not lose the tier: keep the requested effort.
+    effort_answer = answers.get("effort")
+    effort = None
+    if isinstance(effort_answer, dict):
+        effort = pick_effort(effort_answer.get("choice"),
+                             effort_answer.get("confidence"))
+    return pick_tier(choice, confidence), effort, answers
 
 
 async def route(app, body, session_id):
@@ -187,25 +228,42 @@ async def route(app, body, session_id):
     text = user_text(messages[-1]) if is_new_turn(messages[-1]) else ""
     if text.strip():
         start = time.monotonic()
-        tier, answer = await classify(app["session"], app["api_key"], text)
-        sticky[key] = MODELS[tier]
+        tier, effort, answers = await classify(
+            app["session"], app["api_key"], text)
+        sticky[key] = {"model": MODELS[tier], "effort": effort or FALLBACK_EFFORT}
         sticky.move_to_end(key)
         while len(sticky) > STICKY_MAX:
             sticky.popitem(last=False)
-        answer = answer or {}
+        answer = answers.get("tier") or {}
+        effort_answer = answers.get("effort")
+        effort_answer = effort_answer if isinstance(effort_answer, dict) else {}
+        asked = req.get("output_config")
         # The prompt head is already redacted. `--stats` reads these lines.
         log.info("route %s", json.dumps({
             "conv": key, "requested": original, "tier": tier,
             "jev": answer.get("choice"), "confidence": answer.get("confidence"),
             "probs": answer.get("probabilities"),
+            "effort": effort or FALLBACK_EFFORT,
+            "effort_default": effort is None,
+            "effort_jev": effort_answer.get("choice"),
+            "effort_confidence": effort_answer.get("confidence"),
+            "effort_asked": asked.get("effort") if isinstance(asked, dict) else None,
             "ms": round((time.monotonic() - start) * 1000),
             "prompt": " ".join(text.split())[:PROMPT_LOG_CHARS],
         }, ensure_ascii=False))
 
-    model = sticky.get(key)
-    if not model or model == original:
+    chosen = sticky.get(key)
+    if not chosen:
         return None, key
-    req["model"] = model
+    changed = chosen["model"] != original
+    req["model"] = chosen["model"]
+    out = req.get("output_config")
+    out = out if isinstance(out, dict) else {}
+    if chosen["effort"] and out.get("effort") != chosen["effort"]:
+        req["output_config"] = {**out, "effort": chosen["effort"]}
+        changed = True
+    if not changed:
+        return None, key
     return json.dumps(req, separators=(",", ":"),
                       ensure_ascii=False).encode(), key
 
@@ -346,7 +404,12 @@ def summarize(since):
     final = Counter(r["tier"] for r in routes)
     jev = Counter(r["jev"] for r in routes if r.get("jev"))
     ms = sorted(r["ms"] for r in routes if "ms" in r)
+    # Route lines from before the effort feature have no "effort" key.
+    with_effort = [r for r in routes if "effort" in r]
+    effort = Counter(r["effort"] for r in with_effort if r["effort"])
     return {
+        "effort": {e: effort[e] for e in EFFORT_CRITERIA},
+        "effort_default": sum(bool(r.get("effort_default")) for r in with_effort),
         "since": since,
         "total": len(routes),
         "final": {t: final[t] for t in MODELS},
@@ -375,6 +438,11 @@ def stats(since, doubts_max):
     print("\nO que o Jev escolheu (antes do limite de confiança):")
     for tier, n in s["jev"].items():
         print(f"  {tier:<7}{n:>5}")
+    if any(s["effort"].values()):
+        print("\nEsforço (effort) usado:")
+        for name, n in s["effort"].items():
+            print(f"  {name:<7}{n:>5}")
+        print(f"  padrão {FALLBACK_EFFORT}  {s['effort_default']:>3}  (dúvida ou falha do Jev)")
     print(f"\nFoi para {FALLBACK_TIER} por dúvida (confiança < {CONFIDENCE_MIN}): {len(s['doubts'])}")
     print(f"Foi para {FALLBACK_TIER} por falha da TypeSafe: {s['failed']}")
     print(f"Rejeitado pela Anthropic (400) e reenviado sem roteamento: {s['rejects']}")
@@ -407,6 +475,7 @@ def selftest():
     assert user_text(prompt) == "rename foo to bar"
     assert user_text({"content": ["x", 3, {"type": "text", "text": 5}]}) == ""
     assert user_text({"content": "This session is being continued..."}) == ""
+    assert user_text({"content": "[SUGGESTION MODE: Suggest what to do next"}) == ""
     assert len(user_text({"content": "x" * 9000})) == STATE_MAX_CHARS
     secret = user_text({"content": "use sk-ant-abcdefghijklmnopqrstuvwxyz "
                                    "and API_KEY=hunter2"})
@@ -424,10 +493,62 @@ def selftest():
     assert pick_tier("unknown", 0.9) == FALLBACK_TIER
     assert pick_tier(["haiku"], 0.9) == FALLBACK_TIER
     assert pick_tier("sonnet", None) == FALLBACK_TIER
+    assert pick_effort("low", 0.9) == "low"
+    assert pick_effort("max", CONFIDENCE_MIN) == "max"
+    assert pick_effort("low", CONFIDENCE_MIN - 0.01) is None
+    assert pick_effort("low", None) is None
+    assert pick_effort("low", float("nan")) is None
+    assert pick_effort("ultra", 0.9) is None
+    assert pick_effort(["low"], 0.9) is None
+    assert set(EFFORT_CRITERIA) == {"low", "medium", "high", "xhigh", "max"}
     assert parse_route('route {"tier": "haiku"}') == {"tier": "haiku"}
     assert parse_route("route conv=abc tier=opus") is None
     assert parse_route("typesafe_error type=X") is None
+    selftest_route(prompt, tool_result)
     print("selftest OK")
+
+
+def selftest_route(prompt, tool_result):
+    """Check that route() rewrites the model and the effort, and keeps the rest."""
+    global classify
+    real, answers = classify, {"tier": {"choice": "sonnet", "confidence": 0.9}}
+    picked = {}
+
+    async def fake(session, api_key, text):
+        return picked["tier"], picked["effort"], answers
+
+    def body(messages):
+        return json.dumps({
+            "model": "claude-opus-5-5", "messages": messages,
+            "thinking": {"type": "adaptive"},
+            "output_config": {"effort": "medium", "format": {"type": "x"}},
+        }).encode()
+
+    async def run(messages, app):
+        new, _ = await route(app, body(messages), "s")
+        return json.loads(new) if new else None
+
+    classify = fake
+    try:
+        app = {"sticky": OrderedDict(), "session": None, "api_key": "k"}
+        picked.update(tier="sonnet", effort="low")
+        out = asyncio.run(run([prompt], app))
+        assert out["model"] == MODELS["sonnet"], out
+        assert out["output_config"] == {"effort": "low", "format": {"type": "x"}}, out
+        # The tool-result request of the same turn reuses the stored choice.
+        out = asyncio.run(run([prompt, tool_result], app))
+        assert out["model"] == MODELS["sonnet"] and out["output_config"]["effort"] == "low"
+        # Not sure about the effort: use the default, not the effort Claude Code sent.
+        app = {"sticky": OrderedDict(), "session": None, "api_key": "k"}
+        picked.update(tier="sonnet", effort=None)
+        out = asyncio.run(run([prompt], app))
+        assert out["model"] == MODELS["sonnet"] and out["output_config"]["effort"] == FALLBACK_EFFORT
+        # Same model and same effort: the request passes through unchanged.
+        app = {"sticky": OrderedDict(), "session": None, "api_key": "k"}
+        picked.update(tier="opus", effort="medium")
+        assert asyncio.run(run([prompt], app)) is None
+    finally:
+        classify = real
 
 
 if __name__ == "__main__":
