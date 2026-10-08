@@ -1,0 +1,64 @@
+# claude-model-router
+
+Proxy local que escolhe o modelo de cada turno do Claude Code. A cada nova mensagem do usuário, o roteador pergunta ao Jev (TypeSafe) se o turno precisa de Haiku, Sonnet ou Opus.
+
+```
+Claude Code -> headroom (:8787) -> claude-model-router (:8788) -> api.anthropic.com
+```
+
+## Como funciona
+
+- O roteador só muda o modelo do loop principal (requisições com `thinking.type == "adaptive"`). Chamadas auxiliares e pedidos de Haiku passam sem mudança.
+- Se o Jev responde com confiança abaixo de `ROUTER_CONFIDENCE_MIN`, o roteador usa Opus. Se a TypeSafe falha ou demora mais de 5 s, o roteador também usa Opus.
+- O modelo escolhido fica fixo até o fim do turno, porque o cache de prompt é por modelo.
+- O texto enviado ao Jev tem no máximo 1500 caracteres. O roteador mascara chaves e segredos antes de enviar.
+- O roteador fica depois do headroom. Na ordem inversa, o headroom não reconhece `claude-haiku-5`, move as system messages para o topo e a Anthropic responde 400.
+
+## Instalação
+
+Requisitos: [uv](https://docs.astral.sh/uv/), systemd de usuário e o headroom rodando como o serviço `headroom-default`.
+
+1. Copie o script:
+   ```sh
+   install -m 755 claude-model-router ~/.local/bin/
+   ```
+2. Crie o arquivo de ambiente e coloque a sua chave da TypeSafe nele:
+   ```sh
+   install -D -m 600 env.example ~/.config/claude-model-router/env
+   ```
+3. Copie as units do systemd:
+   ```sh
+   cp systemd/claude-model-router.service ~/.config/systemd/user/
+   mkdir -p ~/.config/systemd/user/headroom-default.service.d
+   cp systemd/headroom-default.service.d/model-router.conf ~/.config/systemd/user/headroom-default.service.d/
+   ```
+4. Ative o serviço e reinicie o headroom:
+   ```sh
+   systemctl --user daemon-reload
+   systemctl --user enable --now claude-model-router
+   systemctl --user restart headroom-default
+   ```
+
+O `ANTHROPIC_BASE_URL` do Claude Code continua apontando para o headroom (`http://127.0.0.1:8787`).
+
+## Configuração
+
+| Variável | Padrão | Uso |
+| --- | --- | --- |
+| `TYPESAFE_API_KEY` | (nenhum) | Chave da TypeSafe. Obrigatória: sem ela, o roteador não inicia. |
+| `ROUTER_CONFIDENCE_MIN` | `0.5` | Confiança mínima do Jev. Abaixo dela, o roteador usa Opus. |
+| `ROUTER_PORT` | `8788` | Porta local do roteador. |
+| `ROUTER_UPSTREAM` | `https://api.anthropic.com` | Destino das requisições. |
+
+## Comandos
+
+```sh
+claude-model-router --selftest            # testa a lógica de roteamento
+claude-model-router --stats [since]       # resumo em texto (padrão: today)
+claude-model-router --stats-json today    # o mesmo resumo em JSON
+journalctl --user -u claude-model-router  # logs, uma linha `route {...}` por turno
+```
+
+## Desligar
+
+Apague o drop-in `~/.config/systemd/user/headroom-default.service.d/model-router.conf`. Depois rode `systemctl --user daemon-reload` e reinicie o `headroom-default`.

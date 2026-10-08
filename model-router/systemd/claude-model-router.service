@@ -1,0 +1,14 @@
+[Unit]
+Description=Claude Code model router (TypeSafe), between headroom and Anthropic
+Before=headroom-default.service
+
+[Service]
+Type=simple
+EnvironmentFile=%h/.config/claude-model-router/env
+ExecStart=%h/.local/bin/uv run --script %h/.local/bin/claude-model-router
+Restart=on-failure
+RestartSec=5
+KillSignal=SIGINT
+
+[Install]
+WantedBy=default.target
