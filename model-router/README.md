@@ -61,6 +61,10 @@ claude-model-router --stats-json today    # o mesmo resumo em JSON
 journalctl --user -u claude-model-router  # logs, uma linha `route {...}` por turno
 ```
 
+## Painel
+
+A pasta [`router-view/`](router-view/) tem um mod do Claude Code. O comando `/router` abre um painel lateral com os turnos por modelo, o esforço, os fallbacks e os agentes ativos.
+
 ## Desligar
 
 Apague o drop-in `~/.config/systemd/user/headroom-default.service.d/model-router.conf`. Depois rode `systemctl --user daemon-reload` e reinicie o `headroom-default`.
