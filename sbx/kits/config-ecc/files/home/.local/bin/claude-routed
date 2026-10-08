@@ -1,0 +1,37 @@
+#!/bin/sh
+# Entrypoint do sandbox config-ecc. Se o roteador de modelos esta ligado e ha
+# chave da TypeSafe, sobe o roteador, espera ele responder e aponta o Claude
+# para ele. Se algo falhar, roda o Claude direto: o roteador nunca derruba a
+# sessao.
+#
+# O sbx entrega o Claude (--dangerously-skip-permissions --settings ...
+# --plugin-dir ...) como argumentos deste script.
+BIN=/home/agent/.local/bin
+STATE=/home/agent/.local/state/claude-model-router
+URL=http://127.0.0.1:8788
+WAIT_TRIES=30   # 30 x 0,5 s: tempo que o roteador tem para responder
+
+healthy() { curl -fsS -m 1 -o /dev/null "$URL/_router/health" 2>/dev/null; }
+
+if [ "${KIT_MODEL_ROUTER:-off}" = on ]; then
+  if [ -z "${TYPESAFE_API_KEY:-}" ]; then
+    echo "[model-router] TYPESAFE_API_KEY ausente: rodando sem roteador (veja o README do kit)." >&2
+  else
+    if ! healthy; then
+      mkdir -p -m 700 "$STATE"   # o log tem o comeco de cada prompt
+      nohup uv run --locked --script "$BIN/claude-model-router" >>"$STATE/router.err" 2>&1 </dev/null &
+      tries=0
+      while [ "$tries" -lt "$WAIT_TRIES" ] && ! healthy; do
+        sleep 0.5
+        tries=$((tries + 1))
+      done
+    fi
+    if healthy; then
+      export ANTHROPIC_BASE_URL="$URL"
+    else
+      echo "[model-router] nao respondeu a tempo ($STATE/router.err): rodando sem roteador." >&2
+    fi
+  fi
+fi
+
+exec claude "$@"

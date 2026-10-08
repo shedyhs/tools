@@ -1,9 +1,9 @@
 schemaVersion: "2"
 kind: sandbox
 name: config-ecc
-version: "0.1.0"
-displayName: Claude Code + ECC seletivo + glab
-description: Claude Code com ECC seletivo (skills curadas, agentes, comandos e rules), hooks do ECC ativos e glab configurado
+version: "0.2.0"
+displayName: Claude Code + ECC seletivo + glab + roteador de modelos
+description: Claude Code com ECC seletivo (skills curadas, agentes, comandos e rules), hooks do ECC ativos, glab configurado, roteador de modelos (Jev/TypeSafe) com painel /router e skills de escrita STE
 extends: claude
 sourceURL: https://github.com/affaan-m/ECC
 licenses:
@@ -49,7 +49,15 @@ args:
   disabled_hooks:
     default: ""
     description: Lista separada por virgula de IDs de hook do ECC a desligar (ECC_DISABLED_HOOKS)
-    pattern: '([a-z0-9][a-z0-9:_-]*(,[a-z0-9][a-z0-9:_-]*)*)?' 
+    pattern: '([a-z0-9][a-z0-9:_-]*(,[a-z0-9][a-z0-9:_-]*)*)?'
+  model_router:
+    default: "on"
+    description: Roteador de modelos (o Jev, da TypeSafe, escolhe modelo e esforco). Precisa do secret TYPESAFE_API_KEY. Sem ele, o Claude roda direto
+    enum: ["on", "off"]
+  router_confidence_min:
+    default: "0.5"
+    description: Confianca minima do Jev (ROUTER_CONFIDENCE_MIN). Abaixo dela, o roteador usa opus e high
+    pattern: '^(0(\.[0-9]+)?|1(\.0+)?)$'
 
 environment:
   variables:
@@ -59,12 +67,23 @@ environment:
     GITLAB_HOST: "${{ kit.args.gitlab_host }}"
     KIT_DIRTY_GUARD: "${{ kit.args.dirty_guard }}"
     KIT_COPY_FROM_HOST: "${{ kit.args.copy_from_host }}"
+    KIT_MODEL_ROUTER: "${{ kit.args.model_router }}"
+    ROUTER_CONFIDENCE_MIN: "${{ kit.args.router_confidence_min }}"
+    # O sandbox nao tem journald: o roteador grava o log aqui e o --stats le daqui.
+    ROUTER_LOG_FILE: /home/agent/.local/state/claude-model-router/router.log
+    # Os mods com painel (hooks modules) ainda sao early access no Claude Code do sandbox.
+    CLAUDE_CODE_ENABLE_FUNCTION_HOOKS: "1"
 
 sandbox:
+  # Sobe o roteador (se ligado e com chave) e roda o claude. Veja o script.
+  entrypoint:
+    - /home/agent/.local/bin/claude-routed
   command:
     - --dangerously-skip-permissions
     - --settings
     - /home/agent/.config/claude/ecc.json
+    - --plugin-dir
+    - /home/agent/.local/share/claude-router-view
 
 permissions:
   network:
@@ -74,6 +93,9 @@ permissions:
       - "registry.npmjs.org:443"               # deps da skill qrcode-otp
       - "deb.debian.org:443"                   # update do debian quando levanta o container
       - "*.npmjs.org:443"
+      - "api.typesafe.ai:443"                  # Jev (roteador de modelos)
+      - "pypi.org:443"                         # deps do claude-model-router (uv)
+      - "files.pythonhosted.org:443"
       - "${{ kit.args.gitlab_host }}:443"      # GitLab de trabalho
 
 setup:
@@ -132,12 +154,12 @@ setup:
           };
           fs.writeFileSync(
             "/home/agent/.config/claude/ecc.json",
-            JSON.stringify({ hooks: h.hooks, statusLine }, null, 2)
+            JSON.stringify({ hooks: h.hooks, statusLine, language: "pt-BR" }, null, 2)
           );
           fs.chmodSync("/home/agent/.claude/statusline-command.sh", 0o755);
         '
       user: "1000"
-      description: Ativar hooks, dirty-guard e statusline pela camada --settings
+      description: Ativar hooks, dirty-guard, statusline e idioma pela camada --settings
 
     - command: "apt-get update && apt-get install -y --no-install-recommends sshpass"
       user: "0"
@@ -149,6 +171,14 @@ setup:
         npm install --omit=dev --no-audit --no-fund --loglevel=error
       user: "1000"
       description: Dependencias da skill qrcode-otp
+
+    - command: |
+        set -eu
+        chmod 0755 /home/agent/.local/bin/claude-model-router /home/agent/.local/bin/claude-routed
+        [ "$KIT_MODEL_ROUTER" = on ] || exit 0
+        uv run --locked --script /home/agent/.local/bin/claude-model-router --selftest
+      user: "1000"
+      description: Preparar o claude-model-router (deps fixadas pelo lockfile, no cache do uv, e selftest)
 
     - command: |
         set -eu

@@ -1,0 +1,682 @@
+#!/usr/bin/env -S uv run --script
+# /// script
+# requires-python = ">=3.11"
+# dependencies = ["aiohttp>=3.12.14"]
+# ///
+"""Model router for Claude Code.
+
+Chain: Claude Code -> headroom (:8787) -> this router (:8788) -> Anthropic.
+The router is after headroom because headroom rewrites system messages for
+models that it does not know (claude-haiku-5), and Anthropic rejects that.
+headroom must see the model that Claude Code requested.
+
+On each new user turn, TypeSafe (Jev) selects haiku, sonnet, or opus for the
+request. If Jev is not confident, or if TypeSafe fails, the router uses opus.
+The router keeps the model until the end of the turn, because the prompt
+cache is per model. Requests for haiku (Claude Code background tasks) pass
+through without change. If routing fails, the request passes through.
+
+Run `claude-model-router --selftest` to check the routing logic.
+"""
+
+import asyncio
+import gzip
+import hashlib
+import json
+import logging
+import logging.handlers
+import os
+import re
+import shutil
+import subprocess
+import sys
+import time
+from collections import OrderedDict
+from datetime import datetime
+
+import aiohttp
+from aiohttp import web
+from multidict import CIMultiDict
+
+UPSTREAM = os.environ.get("ROUTER_UPSTREAM", "https://api.anthropic.com")
+PORT = int(os.environ.get("ROUTER_PORT", "8788"))
+# Calibration knob: below this Jev confidence, use FALLBACK_TIER.
+CONFIDENCE_MIN = float(os.environ.get("ROUTER_CONFIDENCE_MIN", "0.5"))
+TYPESAFE_URL = "https://api.typesafe.ai/v1/systemone"
+TYPESAFE_TIMEOUT_S = 5
+# Outbound proxy. A Docker sandbox sends all HTTPS through one. A normal host has none.
+PROXY = os.environ.get("HTTPS_PROXY") or os.environ.get("https_proxy") or None
+# A sandbox has no journald. If ROUTER_LOG_FILE is set, the router also logs to
+# that file, and `--stats` reads the file.
+LOG_FILE = os.environ.get("ROUTER_LOG_FILE")
+STATS_LOG_FILE = LOG_FILE or os.path.expanduser(
+    "~/.local/state/claude-model-router/router.log")
+LOG_FILE_MAX_BYTES = 5 * 1024 * 1024
+HEALTH_PATH = "/_router/health"
+LOG_TIME_FORMAT = "%Y-%m-%dT%H:%M:%S"
+STATE_MAX_CHARS = 1500
+STICKY_MAX = 1000
+PROMPT_LOG_CHARS = 100
+MAX_BODY_BYTES = 32 * 1024 * 1024
+ALLOWED_HOSTS = {f"127.0.0.1:{PORT}", f"localhost:{PORT}"}
+
+MODELS = {
+    "haiku": "claude-haiku-5-5",
+    "sonnet": "claude-sonnet-5-5",
+    "opus": "claude-opus-5-5",
+}
+FALLBACK_TIER = "opus"
+# Effort used when Jev is not sure, or TypeSafe fails.
+FALLBACK_EFFORT = "high"
+
+CRITERIA = {
+    "haiku": "Trivial: a quick question, a lookup, a rename, formatting, "
+    "a one-line edit, or a short explanation of known code.",
+    "sonnet": "Standard coding work: implement or change a feature in a few "
+    "files, debug an error with a clear message, write tests, or edit config.",
+    "opus": "Complex work: architecture or design decisions, multi-file "
+    "refactors, subtle or intermittent bugs, security, ambiguous "
+    "requirements, research, or planning.",
+}
+INSTRUCTIONS = (
+    "A developer sent this request to a coding agent. Select the smallest "
+    "model tier that can do the request correctly."
+)
+
+# Valid values of output_config.effort. Jev picks one for each new turn.
+EFFORT_CRITERIA = {
+    "low": "Little reasoning: a lookup, a rename, formatting, a one-line "
+    "edit, or a short answer.",
+    "medium": "Some reasoning: a clear change in one or two files, or an "
+    "explanation of known code.",
+    "high": "Careful reasoning: a feature in several files, debugging an "
+    "error, or writing tests.",
+    "xhigh": "Deep reasoning: a hard bug, a refactor across many files, or "
+    "a design trade-off.",
+    "max": "Maximum reasoning: ambiguous or high-risk work, or research, "
+    "where a mistake is costly.",
+}
+EFFORT_INSTRUCTIONS = (
+    "A developer sent this request to a coding agent. Select the lowest "
+    "reasoning effort that can do the request correctly."
+)
+
+# Text that Claude Code injects as a user message. It is not a new request.
+INJECTED_PREFIXES = ("<system-reminder>", "<command-", "<local-command",
+                     "This session is being continued", "[Request interrupted",
+                     "[SUGGESTION MODE")
+# ponytail: common secret shapes only. Extend if a new key format leaks.
+SECRET_RE = re.compile(
+    r"sk-[A-Za-z0-9_-]{20,}|AKIA[0-9A-Z]{16}|gh[pousr]_[A-Za-z0-9]{20,}"
+    r"|glpat-[\w-]{20,}|xox[abposr]-\S+|eyJ[\w-]+\.[\w-]+\.[\w-]+"
+    r"|-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z ]*PRIVATE KEY-----"
+    r"|Bearer\s+\S{20,}|\b\w*(?:KEY|TOKEN|SECRET|PASSWORD)\w*\s*[=:]\s*\S+",
+    re.IGNORECASE)
+
+HOP_BY_HOP = {"connection", "keep-alive", "transfer-encoding", "te", "trailer",
+              "upgrade", "proxy-authorization", "proxy-connection",
+              "content-length"}
+
+log = logging.getLogger("model-router")
+
+
+def is_new_turn(message):
+    """True if the message is a user prompt, not a tool result."""
+    if not isinstance(message, dict) or message.get("role") != "user":
+        return False
+    content = message.get("content")
+    if isinstance(content, str):
+        return True
+    return not any(isinstance(b, dict) and b.get("type") == "tool_result"
+                   for b in content or [])
+
+
+def user_text(message):
+    """Return the text that the user typed, without injected blocks."""
+    content = message.get("content")
+    blocks = [content] if isinstance(content, str) else [
+        b.get("text") for b in content or []
+        if isinstance(b, dict) and b.get("type") == "text"]
+    parts = [t for t in blocks if isinstance(t, str)
+             and not t.lstrip().startswith(INJECTED_PREFIXES)]
+    return SECRET_RE.sub("[redacted]", "\n".join(parts))[:STATE_MAX_CHARS]
+
+
+def chat_messages(messages):
+    """Drop the system messages that Claude Code puts between turns (hook
+    output, tool additions). The last user or assistant message is the turn."""
+    return [m for m in messages
+            if isinstance(m, dict) and m.get("role") != "system"]
+
+
+def conversation_key(messages, session_id=""):
+    """Identify a thread by session and first message. Subagents get their
+    own key."""
+    first = messages[0]
+    content = first.get("content") if isinstance(first, dict) else first
+    if isinstance(content, list):
+        # cache_control moves between requests, so it is not part of the key.
+        content = [{k: v for k, v in b.items() if k != "cache_control"}
+                   if isinstance(b, dict) else b for b in content]
+    raw = json.dumps([session_id, content], sort_keys=True, default=str).encode()
+    return hashlib.sha256(raw).hexdigest()[:16]
+
+
+def pick_tier(choice, confidence):
+    if not isinstance(choice, str) or choice not in MODELS:
+        return FALLBACK_TIER
+    if confidence is None or not confidence >= CONFIDENCE_MIN:
+        return FALLBACK_TIER
+    return choice
+
+
+def pick_effort(choice, confidence):
+    """Return the effort, or None when Jev is not sure."""
+    if not isinstance(choice, str) or choice not in EFFORT_CRITERIA:
+        return None
+    if not isinstance(confidence, (int, float)) or not confidence >= CONFIDENCE_MIN:
+        return None
+    return choice
+
+
+async def classify(session, api_key, text):
+    """Return (tier, effort, Jev answers). The answers are {} if TypeSafe
+    failed, and the effort is then None."""
+    payload = {
+        "model": "jev-latest",
+        "state": {"request": text},
+        "questions": {"tier": {"type": "choice",
+                               "instructions": INSTRUCTIONS,
+                               "criteria": CRITERIA},
+                      "effort": {"type": "choice",
+                                 "instructions": EFFORT_INSTRUCTIONS,
+                                 "criteria": EFFORT_CRITERIA}},
+    }
+    try:
+        async with session.post(
+            TYPESAFE_URL, json=payload,
+            headers={"Authorization": f"Bearer {api_key}",
+                     "Accept-Encoding": "identity"},
+            timeout=aiohttp.ClientTimeout(total=TYPESAFE_TIMEOUT_S),
+            proxy=PROXY,
+        ) as resp:
+            resp.raise_for_status()
+            answers = (await resp.json())["answers"]
+        answer = answers["tier"]
+        choice, confidence = answer["choice"], float(answer["confidence"])
+    except (aiohttp.ClientError, asyncio.TimeoutError, KeyError,
+            TypeError, ValueError) as exc:
+        # Never log repr(exc): aiohttp puts the request headers (the API key)
+        # in it.
+        log.warning("typesafe_error type=%s status=%s fallback=%s",
+                    type(exc).__name__, getattr(exc, "status", "-"),
+                    FALLBACK_TIER)
+        return FALLBACK_TIER, None, {}
+    # A bad effort answer must not lose the tier: keep the requested effort.
+    effort_answer = answers.get("effort")
+    effort = None
+    if isinstance(effort_answer, dict):
+        effort = pick_effort(effort_answer.get("choice"),
+                             effort_answer.get("confidence"))
+    return pick_tier(choice, confidence), effort, answers
+
+
+async def route(app, body, session_id):
+    """Return (new body or None, conversation key or None)."""
+    req = json.loads(body)
+    if not isinstance(req, dict):
+        return None, None
+    original = str(req.get("model", ""))
+    raw_messages = req.get("messages")
+    if not isinstance(raw_messages, list) or "haiku" in original:
+        return None, None
+    # Only the main agent loop uses adaptive thinking. Side calls (titles,
+    # headroom internals) pass through, and their text stays local.
+    thinking = req.get("thinking")
+    if not isinstance(thinking, dict) or thinking.get("type") != "adaptive":
+        return None, None
+    messages = chat_messages(raw_messages)
+    if not messages:
+        return None, None
+
+    key = conversation_key(messages, session_id)
+    sticky = app["sticky"]
+    text = user_text(messages[-1]) if is_new_turn(messages[-1]) else ""
+    if text.strip():
+        start = time.monotonic()
+        tier, effort, answers = await classify(
+            app["session"], app["api_key"], text)
+        sticky[key] = {"model": MODELS[tier], "effort": effort or FALLBACK_EFFORT}
+        sticky.move_to_end(key)
+        while len(sticky) > STICKY_MAX:
+            sticky.popitem(last=False)
+        answer = answers.get("tier") or {}
+        effort_answer = answers.get("effort")
+        effort_answer = effort_answer if isinstance(effort_answer, dict) else {}
+        asked = req.get("output_config")
+        # The prompt head is already redacted. `--stats` reads these lines.
+        log.info("route %s", json.dumps({
+            "conv": key, "requested": original, "tier": tier,
+            "jev": answer.get("choice"), "confidence": answer.get("confidence"),
+            "probs": answer.get("probabilities"),
+            "effort": effort or FALLBACK_EFFORT,
+            "effort_default": effort is None,
+            "effort_jev": effort_answer.get("choice"),
+            "effort_confidence": effort_answer.get("confidence"),
+            "effort_asked": asked.get("effort") if isinstance(asked, dict) else None,
+            "ms": round((time.monotonic() - start) * 1000),
+            "prompt": " ".join(text.split())[:PROMPT_LOG_CHARS],
+        }, ensure_ascii=False))
+
+    chosen = sticky.get(key)
+    if not chosen:
+        return None, key
+    changed = chosen["model"] != original
+    req["model"] = chosen["model"]
+    out = req.get("output_config")
+    out = out if isinstance(out, dict) else {}
+    if chosen["effort"] and out.get("effort") != chosen["effort"]:
+        req["output_config"] = {**out, "effort": chosen["effort"]}
+        changed = True
+    if not changed:
+        return None, key
+    return json.dumps(req, separators=(",", ":"),
+                      ensure_ascii=False).encode(), key
+
+
+def error_summary(raw, encoding):
+    """Return 'type: message' from an Anthropic error body, or '-'."""
+    try:
+        if encoding == "gzip":
+            raw = gzip.decompress(raw)
+        err = json.loads(raw).get("error", {})
+        return f"{err.get('type')}: {str(err.get('message'))[:200]}"
+    except (OSError, ValueError, AttributeError):
+        return "-"
+
+
+def bad_gateway():
+    return web.json_response(
+        {"type": "error",
+         "error": {"type": "api_error", "message": "model router: upstream unavailable"}},
+        status=502)
+
+
+async def proxy(request):
+    # Block browsers (DNS rebinding, cross-site POST). Claude Code sends no Origin.
+    if request.host not in ALLOWED_HOSTS or "Origin" in request.headers:
+        raise web.HTTPForbidden()
+    if request.method == "GET" and request.path == HEALTH_PATH:
+        return web.Response(text="ok")  # No upstream call: only "is it up?".
+
+    app = request.app
+    body = await request.read()
+    headers = [(k, v) for k, v in request.headers.items()
+               if k.lower() not in HOP_BY_HOP | {"host"}]
+    has_credential = ("Authorization" in request.headers
+                      or "x-api-key" in request.headers)
+
+    routed, key = None, None
+    if (request.method == "POST" and request.path == "/v1/messages"
+            and has_credential):
+        try:
+            routed, key = await route(
+                app, body, request.headers.get("X-Claude-Code-Session-Id", ""))
+        except Exception as exc:  # A routing bug must not break the session.
+            log.warning("route_failed type=%s", type(exc).__name__)
+
+    url = UPSTREAM + request.raw_path
+    session = app["session"]
+    try:
+        upstream = await session.request(request.method, url, headers=headers,
+                                         data=routed or body,
+                                         allow_redirects=False, proxy=PROXY)
+        if routed and upstream.status == 400:
+            # The routed model rejected a parameter (for example a beta
+            # header). Send the original request, and stop routing this turn.
+            log.warning("routed_400 conv=%s request_id=%s error=%s", key,
+                        upstream.headers.get("request-id", "-"),
+                        error_summary(await upstream.read(),
+                                      upstream.headers.get("Content-Encoding")))
+            upstream.release()
+            app["sticky"].pop(key, None)
+            upstream = await session.request(request.method, url,
+                                             headers=headers, data=body,
+                                             allow_redirects=False,
+                                             proxy=PROXY)
+    except aiohttp.ClientError as exc:
+        log.warning("upstream_error type=%s", type(exc).__name__)
+        return bad_gateway()
+
+    try:
+        resp = web.StreamResponse(
+            status=upstream.status,
+            headers=CIMultiDict((k, v) for k, v in upstream.headers.items()
+                                if k.lower() not in HOP_BY_HOP))
+        await resp.prepare(request)
+        async for chunk in upstream.content.iter_any():
+            await resp.write(chunk)
+        await resp.write_eof()
+        return resp
+    finally:
+        upstream.release()
+
+
+async def on_startup(app):
+    # auto_decompress=False: bytes and content-encoding pass through unchanged.
+    app["session"] = aiohttp.ClientSession(
+        timeout=aiohttp.ClientTimeout(total=None, sock_read=600),
+        auto_decompress=False, cookie_jar=aiohttp.DummyCookieJar())
+
+
+async def on_cleanup(app):
+    await app["session"].close()
+
+
+def add_log_file(path):
+    """Also log to a file, with a timestamp, for `--stats` where there is no
+    journald. The folder is private: log lines hold the head of each prompt."""
+    os.umask(0o077)  # Also for the new file after each rotation.
+    os.makedirs(os.path.dirname(path), mode=0o700, exist_ok=True)
+    handler = logging.handlers.RotatingFileHandler(
+        path, maxBytes=LOG_FILE_MAX_BYTES, backupCount=1, encoding="utf-8")
+    os.chmod(path, 0o600)
+    handler.setFormatter(logging.Formatter(
+        "%(asctime)s\t%(levelname)s %(name)s %(message)s", LOG_TIME_FORMAT))
+    logging.getLogger().addHandler(handler)
+
+
+def main():
+    logging.basicConfig(level=logging.INFO,
+                        format="%(levelname)s %(name)s %(message)s")
+    if LOG_FILE:
+        # Route lines (with prompt heads) go only to the rotated file. stderr
+        # keeps warnings and errors, so its file stays small.
+        for handler in logging.getLogger().handlers:
+            handler.setLevel(logging.WARNING)
+        add_log_file(LOG_FILE)
+    api_key = os.environ.get("TYPESAFE_API_KEY")
+    if not api_key:
+        sys.exit("TYPESAFE_API_KEY is not set.")
+    app = web.Application(client_max_size=MAX_BODY_BYTES)
+    app["api_key"] = api_key
+    app["sticky"] = OrderedDict()
+    app.on_startup.append(on_startup)
+    app.on_cleanup.append(on_cleanup)
+    app.router.add_route("*", "/{tail:.*}", proxy)
+    web.run_app(app, host="127.0.0.1", port=PORT, print=None, access_log=None)
+
+
+def parse_route(message):
+    """Return the dict from a `route {...}` log line, or None."""
+    if not message.startswith("route {"):
+        return None
+    try:
+        return json.loads(message[len("route "):])
+    except ValueError:
+        return None
+
+
+def since_epoch(since):
+    """Seconds since the epoch for 'today' or 'YYYY-MM-DD[ HH:MM[:SS]]', local time."""
+    now = datetime.now()
+    if since == "today":
+        return datetime(now.year, now.month, now.day).timestamp()
+    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M", "%Y-%m-%d"):
+        try:
+            return datetime.strptime(since, fmt).timestamp()
+        except ValueError:
+            pass
+    raise SystemExit(f"Sem journald, --since aceita 'today' ou 'AAAA-MM-DD [HH:MM]': {since!r}")
+
+
+def read_log_file(path, since):
+    """Return (epoch, message) pairs from the log file since `since`. The
+    rotated file (`.1`) comes first, because it holds the older lines."""
+    cutoff, entries = since_epoch(since), []
+    for name in (path + ".1", path):
+        if not os.path.exists(name):
+            continue
+        with open(name, encoding="utf-8", errors="replace") as f:
+            for line in f:
+                stamp, _, msg = line.rstrip("\n").partition("\t")
+                try:
+                    epoch = datetime.strptime(stamp, LOG_TIME_FORMAT).timestamp()
+                except ValueError:
+                    continue  # A line of a traceback has no timestamp.
+                if epoch >= cutoff:
+                    entries.append((epoch, msg))
+    return entries
+
+
+def read_entries(since):
+    """Return (epoch, message) pairs: from the log file if there is one, else
+    from journald, else nothing."""
+    if os.path.exists(STATS_LOG_FILE):
+        return read_log_file(STATS_LOG_FILE, since)
+    if not shutil.which("journalctl"):
+        return []
+    out = subprocess.run(
+        ["journalctl", "--user", "-u", "claude-model-router", "-o", "json",
+         "--no-pager", "--since", since],
+        capture_output=True, text=True, check=True).stdout
+    entries = []
+    for line in out.splitlines():
+        entry = json.loads(line)
+        if isinstance(entry.get("MESSAGE"), str):
+            entries.append((int(entry["__REALTIME_TIMESTAMP"]) / 1e6,
+                            entry["MESSAGE"]))
+    return entries
+
+
+def summarize(since):
+    """Read the route lines since `since` and count them."""
+    from collections import Counter
+    routes, rejects = [], 0
+    for epoch, msg in read_entries(since):
+        msg = msg.split("model-router ", 1)[-1]
+        if msg.startswith("routed_400"):
+            rejects += 1
+        elif (r := parse_route(msg)) is not None:
+            r["ts"] = datetime.fromtimestamp(epoch).strftime("%d/%m %H:%M")
+            routes.append(r)
+    final = Counter(r["tier"] for r in routes)
+    jev = Counter(r["jev"] for r in routes if r.get("jev"))
+    ms = sorted(r["ms"] for r in routes if "ms" in r)
+    # Route lines from before the effort feature have no "effort" key.
+    with_effort = [r for r in routes if "effort" in r]
+    effort = Counter(r["effort"] for r in with_effort if r["effort"])
+    return {
+        "effort": {e: effort[e] for e in EFFORT_CRITERIA},
+        "effort_default": sum(bool(r.get("effort_default")) for r in with_effort),
+        "since": since,
+        "total": len(routes),
+        "final": {t: final[t] for t in MODELS},
+        "jev": {t: jev[t] for t in MODELS},
+        "doubts": [r for r in routes if r.get("confidence") is not None
+                   and r["tier"] != r.get("jev")],
+        "failed": sum(r.get("confidence") is None for r in routes),
+        "rejects": rejects,
+        "ms_median": ms[len(ms) // 2] if ms else None,
+        "ms_max": ms[-1] if ms else None,
+        "confidence_min": CONFIDENCE_MIN,
+        "fallback": FALLBACK_TIER,
+    }
+
+
+def stats(since, doubts_max):
+    """Print a routing summary from journald."""
+    s = summarize(since)
+    total = s["total"]
+    print(f"Desde: {since}   turnos roteados: {total}")
+    if not total:
+        return
+    print("\nModelo usado:")
+    for tier, n in s["final"].items():
+        print(f"  {tier:<7}{n:>5}  {n * 100 / total:5.1f}%  {'█' * round(n * 20 / total)}")
+    print("\nO que o Jev escolheu (antes do limite de confiança):")
+    for tier, n in s["jev"].items():
+        print(f"  {tier:<7}{n:>5}")
+    if any(s["effort"].values()):
+        print("\nEsforço (effort) usado:")
+        for name, n in s["effort"].items():
+            print(f"  {name:<7}{n:>5}")
+        print(f"  padrão {FALLBACK_EFFORT}  {s['effort_default']:>3}  (dúvida ou falha do Jev)")
+    print(f"\nFoi para {FALLBACK_TIER} por dúvida (confiança < {CONFIDENCE_MIN}): {len(s['doubts'])}")
+    print(f"Foi para {FALLBACK_TIER} por falha da TypeSafe: {s['failed']}")
+    print(f"Rejeitado pela Anthropic (400) e reenviado sem roteamento: {s['rejects']}")
+    if s["ms_median"] is not None:
+        print(f"Latência do Jev: mediana {s['ms_median']} ms, máx {s['ms_max']} ms")
+    if s["doubts"]:
+        print(f"\nDúvidas mais recentes (até {doubts_max}):")
+        for r in s["doubts"][-doubts_max:]:
+            probs = r.get("probs") or {}
+            dist = " ".join(f"{k[0]}={probs[k]:.2f}" for k in MODELS if k in probs)
+            print(f"  {r['ts']}  conf={r['confidence']:.2f}  "
+                  f"jev={r['jev']:<6} [{dist}]  {r.get('prompt', '')}")
+
+
+def selftest():
+    reminder = {"type": "text", "text": "<system-reminder>r</system-reminder>"}
+    tool_result = {"role": "user", "content": [
+        {"type": "tool_result", "tool_use_id": "x", "content": "ok"}, reminder]}
+    prompt = {"role": "user", "content": [
+        reminder, {"type": "text", "text": "rename foo to bar"}]}
+    cached = {"role": "user", "content": [
+        reminder, {"type": "text", "text": "rename foo to bar",
+                   "cache_control": {"type": "ephemeral"}}]}
+
+    assert is_new_turn({"role": "user", "content": "hi"})
+    assert is_new_turn(prompt)
+    assert not is_new_turn(tool_result)
+    assert not is_new_turn({"role": "assistant", "content": "hi"})
+    assert not is_new_turn("not a dict")
+    assert user_text(prompt) == "rename foo to bar"
+    assert user_text({"content": ["x", 3, {"type": "text", "text": 5}]}) == ""
+    assert user_text({"content": "This session is being continued..."}) == ""
+    assert user_text({"content": "[SUGGESTION MODE: Suggest what to do next"}) == ""
+    assert len(user_text({"content": "x" * 9000})) == STATE_MAX_CHARS
+    secret = user_text({"content": "use sk-ant-abcdefghijklmnopqrstuvwxyz "
+                                   "and API_KEY=hunter2"})
+    assert "sk-ant" not in secret and "hunter2" not in secret, secret
+    tokens = user_text({"content": "glpat-abcdefghijklmnopqrstu xoxb-123-abc "
+                                   "eyJhbGciOi.eyJzdWIiOiIx.c2lnbmF0dXJl ok"})
+    assert tokens == "[redacted] [redacted] [redacted] ok", tokens
+    assert conversation_key([prompt]) == conversation_key([cached, tool_result])
+    assert conversation_key([prompt]) != conversation_key([tool_result])
+    assert conversation_key([prompt], "s1") != conversation_key([prompt], "s2")
+    hook = {"role": "system", "content": [{"type": "text", "text": "hook"}]}
+    turn = chat_messages([prompt, hook])
+    assert turn == [prompt] and is_new_turn(turn[-1])
+    assert not is_new_turn(chat_messages([prompt, tool_result, hook])[-1])
+    assert pick_tier("haiku", 0.9) == "haiku"
+    assert pick_tier("haiku", CONFIDENCE_MIN - 0.01) == FALLBACK_TIER
+    assert pick_tier("haiku", float("nan")) == FALLBACK_TIER
+    assert pick_tier("unknown", 0.9) == FALLBACK_TIER
+    assert pick_tier(["haiku"], 0.9) == FALLBACK_TIER
+    assert pick_tier("sonnet", None) == FALLBACK_TIER
+    assert pick_effort("low", 0.9) == "low"
+    assert pick_effort("max", CONFIDENCE_MIN) == "max"
+    assert pick_effort("low", CONFIDENCE_MIN - 0.01) is None
+    assert pick_effort("low", None) is None
+    assert pick_effort("low", float("nan")) is None
+    assert pick_effort("ultra", 0.9) is None
+    assert pick_effort(["low"], 0.9) is None
+    assert set(EFFORT_CRITERIA) == {"low", "medium", "high", "xhigh", "max"}
+    assert parse_route('route {"tier": "haiku"}') == {"tier": "haiku"}
+    assert parse_route("route conv=abc tier=opus") is None
+    assert parse_route("typesafe_error type=X") is None
+    selftest_route(prompt, tool_result)
+    selftest_log_file()
+    print("selftest OK")
+
+
+def selftest_log_file():
+    """Check that `--stats` reads the log file, and only the lines from today."""
+    import tempfile
+    assert since_epoch("today") <= time.time()
+    assert since_epoch("2020-01-02") < since_epoch("2020-01-02 10:30")
+    # A fixed day, so the test does not depend on the clock (midnight).
+    stamp, day = "2030-05-06T12:00:00", "2030-05-06"
+    route = json.dumps({"tier": "haiku", "jev": "haiku", "confidence": 0.9,
+                        "effort": "low", "effort_default": False, "ms": 300})
+    lines = [f"2020-01-02T10:00:00\tINFO model-router route {route}",
+             f"{stamp}\tINFO model-router route {route}",
+             f"{stamp}\tWARNING model-router routed_400 conv=x",
+             "Traceback (most recent call last):"]
+    with tempfile.TemporaryDirectory() as tmp:
+        path = os.path.join(tmp, "router.log")
+        with open(path, "w", encoding="utf-8") as f:
+            f.write("\n".join(lines) + "\n")
+        today = read_log_file(path, day)
+        assert len(today) == 2, today
+        assert len(read_log_file(path, "2020-01-01")) == 3
+        # After a rotation, the older lines are in `.1` and still count.
+        os.rename(path, path + ".1")
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(f"{stamp}\tINFO model-router route {route}\n")
+        assert len(read_log_file(path, day)) == 3
+        global STATS_LOG_FILE
+        saved, STATS_LOG_FILE = STATS_LOG_FILE, path
+        try:
+            s = summarize(day)
+        finally:
+            STATS_LOG_FILE = saved
+        assert s["total"] == 2 and s["rejects"] == 1, s
+        assert s["final"]["haiku"] == 2 and s["effort"]["low"] == 2, s
+
+
+def selftest_route(prompt, tool_result):
+    """Check that route() rewrites the model and the effort, and keeps the rest."""
+    global classify
+    real, answers = classify, {"tier": {"choice": "sonnet", "confidence": 0.9}}
+    picked = {}
+
+    async def fake(session, api_key, text):
+        return picked["tier"], picked["effort"], answers
+
+    def body(messages):
+        return json.dumps({
+            "model": "claude-opus-5-5", "messages": messages,
+            "thinking": {"type": "adaptive"},
+            "output_config": {"effort": "medium", "format": {"type": "x"}},
+        }).encode()
+
+    async def run(messages, app):
+        new, _ = await route(app, body(messages), "s")
+        return json.loads(new) if new else None
+
+    classify = fake
+    try:
+        app = {"sticky": OrderedDict(), "session": None, "api_key": "k"}
+        picked.update(tier="sonnet", effort="low")
+        out = asyncio.run(run([prompt], app))
+        assert out["model"] == MODELS["sonnet"], out
+        assert out["output_config"] == {"effort": "low", "format": {"type": "x"}}, out
+        # The tool-result request of the same turn reuses the stored choice.
+        out = asyncio.run(run([prompt, tool_result], app))
+        assert out["model"] == MODELS["sonnet"] and out["output_config"]["effort"] == "low"
+        # Not sure about the effort: use the default, not the effort Claude Code sent.
+        app = {"sticky": OrderedDict(), "session": None, "api_key": "k"}
+        picked.update(tier="sonnet", effort=None)
+        out = asyncio.run(run([prompt], app))
+        assert out["model"] == MODELS["sonnet"] and out["output_config"]["effort"] == FALLBACK_EFFORT
+        # Same model and same effort: the request passes through unchanged.
+        app = {"sticky": OrderedDict(), "session": None, "api_key": "k"}
+        picked.update(tier="opus", effort="medium")
+        assert asyncio.run(run([prompt], app)) is None
+    finally:
+        classify = real
+
+
+if __name__ == "__main__":
+    if "--selftest" in sys.argv:
+        selftest()
+    elif "--stats" in sys.argv:
+        args = sys.argv[sys.argv.index("--stats") + 1:]
+        stats(args[0] if args else "today", 15)
+    elif "--stats-json" in sys.argv:
+        args = sys.argv[sys.argv.index("--stats-json") + 1:]
+        print(json.dumps(summarize(args[0] if args else "today"), ensure_ascii=False))
+    else:
+        main()
