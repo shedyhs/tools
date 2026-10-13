@@ -21,6 +21,9 @@ export type Summary = {
   // Absent when the router predates the effort feature.
   effort?: Record<string, number>
   effort_default?: number
+  // Absent when the router predates the coverage rule.
+  doubt_tiers?: Record<string, number>
+  coverage?: number
 }
 
 export const BAR_WIDTH = 12

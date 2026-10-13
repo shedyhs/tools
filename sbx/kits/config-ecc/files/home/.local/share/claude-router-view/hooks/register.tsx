@@ -113,32 +113,39 @@ export const register: Register = on => {
           <Box flexDirection="column">
             <Text> </Text>
             {tiers.map(tier => {
-              const [full, empty] = bar(s.final[tier], s.total)
+              const [full, empty] = bar(s.final[tier] ?? 0, s.total)
               return (
                 <Text>
                   <Text color={TIER_COLOR[tier]}>{tier.padEnd(7)}</Text>
                   <Text color={TIER_COLOR[tier]}>{full}</Text>
                   <Text dimColor>{empty}</Text>
                   <Text> {String(s.final[tier]).padStart(3)}</Text>
-                  <Text dimColor>{percent(s.final[tier], s.total)}</Text>
+                  <Text dimColor>{percent(s.final[tier] ?? 0, s.total)}</Text>
                 </Text>
               )
             })}
             <Text dimColor>
-              Jev pediu: {tiers.map(t => `${t[0].toUpperCase()} ${s.jev[t]}`).join(' · ')}
+              Jev pediu: {tiers.map(t => `${t.charAt(0).toUpperCase()} ${s.jev[t]}`).join(' · ')}
             </Text>
             <Text dimColor>Esforço: {effortLine(s.effort, s.effort_default)}</Text>
             <Text> </Text>
 
-            <Text bold>Fallback para {s.fallback}</Text>
+            <Text bold>Dúvidas e falhas</Text>
             <Text>
               <Text dimColor>{'dúvida'.padEnd(9)}</Text>
               <Text color={s.doubts.length ? 'warning' : undefined}>{s.doubts.length}</Text>
               <Text dimColor>  (conf {'<'} {s.confidence_min})</Text>
             </Text>
+            <Text dimColor>
+              {'  →'.padEnd(9)}
+              {s.doubt_tiers
+                ? tiers.map(t => `${t.charAt(0).toUpperCase()} ${s.doubt_tiers?.[t] ?? 0}`).join(' · ')
+                : s.fallback}
+            </Text>
             <Text>
               <Text dimColor>{'falha'.padEnd(9)}</Text>
               <Text color={s.failed ? 'error' : undefined}>{s.failed}</Text>
+              <Text dimColor>  (→ {s.fallback})</Text>
             </Text>
             <Text>
               <Text dimColor>{'400'.padEnd(9)}</Text>

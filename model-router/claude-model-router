@@ -11,7 +11,10 @@ models that it does not know (claude-haiku-5), and Anthropic rejects that.
 headroom must see the model that Claude Code requested.
 
 On each new user turn, TypeSafe (Jev) selects haiku, sonnet, or opus for the
-request. If Jev is not confident, or if TypeSafe fails, the router uses opus.
+request. Jev also sees the head of the earlier conversation, so that a short
+reply ("yes", "do all three") gets the size of the work it agrees to. If Jev
+is not confident, the router uses the smallest tier that covers COVERAGE of
+Jev's probabilities. If TypeSafe fails, the router uses opus.
 The router keeps the model until the end of the turn, because the prompt
 cache is per model. Requests for haiku (Claude Code background tasks) pass
 through without change. If routing fails, the request passes through.
@@ -40,8 +43,15 @@ from multidict import CIMultiDict
 
 UPSTREAM = os.environ.get("ROUTER_UPSTREAM", "https://api.anthropic.com")
 PORT = int(os.environ.get("ROUTER_PORT", "8788"))
-# Calibration knob: below this Jev confidence, use FALLBACK_TIER.
+# Calibration knobs. Below CONFIDENCE_MIN, the router does not use Jev's choice.
+# It uses the smallest option whose probability, added from the smallest
+# option up, reaches COVERAGE.
 CONFIDENCE_MIN = float(os.environ.get("ROUTER_CONFIDENCE_MIN", "0.5"))
+COVERAGE = float(os.environ.get("ROUTER_COVERAGE", "0.8"))
+# Earlier conversation that Jev sees: the last messages, newest first, up to
+# this many characters in total.
+CONTEXT_MAX_CHARS = max(0, min(int(os.environ.get("ROUTER_CONTEXT_CHARS", "3000")), 8000))
+CONTEXT_MSG_CHARS = 800
 TYPESAFE_URL = "https://api.typesafe.ai/v1/systemone"
 TYPESAFE_TIMEOUT_S = 5
 # Outbound proxy. A Docker sandbox sends all HTTPS through one. A normal host has none.
@@ -78,9 +88,12 @@ CRITERIA = {
     "refactors, subtle or intermittent bugs, security, ambiguous "
     "requirements, research, or planning.",
 }
+CONTEXT_NOTE = (
+    " If the text has an earlier conversation, classify only the new request."
+    " Use the earlier conversation only to understand the new request.")
 INSTRUCTIONS = (
     "A developer sent this request to a coding agent. Select the smallest "
-    "model tier that can do the request correctly."
+    "model tier that can do the request correctly." + CONTEXT_NOTE
 )
 
 # Valid values of output_config.effort. Jev picks one for each new turn.
@@ -98,19 +111,27 @@ EFFORT_CRITERIA = {
 }
 EFFORT_INSTRUCTIONS = (
     "A developer sent this request to a coding agent. Select the lowest "
-    "reasoning effort that can do the request correctly."
+    "reasoning effort that can do the request correctly." + CONTEXT_NOTE
 )
 
 # Text that Claude Code injects as a user message. It is not a new request.
 INJECTED_PREFIXES = ("<system-reminder>", "<command-", "<local-command",
                      "This session is being continued", "[Request interrupted",
-                     "[SUGGESTION MODE")
+                     "[SUGGESTION MODE", "Base directory for this skill",
+                     "<bash-")   # `!` shell commands and their output
+# A slash command arrives as these tags plus the command body. Jev sees the
+# command and its arguments, not the body (a skill or a prompt template).
+# [^<]* keeps the search linear on a large body with an unclosed tag.
+COMMAND_RE = re.compile(r"<command-name>([^<]*)</command-name>")
+COMMAND_ARGS_RE = re.compile(r"<command-args>([^<]*)</command-args>")
 # ponytail: common secret shapes only. Extend if a new key format leaks.
 SECRET_RE = re.compile(
     r"sk-[A-Za-z0-9_-]{20,}|AKIA[0-9A-Z]{16}|gh[pousr]_[A-Za-z0-9]{20,}"
     r"|glpat-[\w-]{20,}|xox[abposr]-\S+|eyJ[\w-]+\.[\w-]+\.[\w-]+"
-    r"|-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z ]*PRIVATE KEY-----"
-    r"|Bearer\s+\S{20,}|\b\w*(?:KEY|TOKEN|SECRET|PASSWORD)\w*\s*[=:]\s*\S+",
+    r"|-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?(?:-----END [A-Z ]*PRIVATE KEY-----|$)"
+    r"|\w+://[^\s:/@]+:[^\s@]+@"
+    r"|Bearer\s+\S{20,}"
+    r"|\b\w*(?:KEY|TOKEN|SECRET|PASSWORD|PASSWD|PASS)\w*[\"']?\s*[=:]\s*\S+",
     re.IGNORECASE)
 
 HOP_BY_HOP = {"connection", "keep-alive", "transfer-encoding", "te", "trailer",
@@ -131,15 +152,88 @@ def is_new_turn(message):
                    for b in content or [])
 
 
-def user_text(message):
-    """Return the text that the user typed, without injected blocks."""
+def text_blocks(message):
     content = message.get("content")
     blocks = [content] if isinstance(content, str) else [
         b.get("text") for b in content or []
         if isinstance(b, dict) and b.get("type") == "text"]
-    parts = [t for t in blocks if isinstance(t, str)
-             and not t.lstrip().startswith(INJECTED_PREFIXES)]
-    return SECRET_RE.sub("[redacted]", "\n".join(parts))[:STATE_MAX_CHARS]
+    return [t for t in blocks if isinstance(t, str)]
+
+
+def redact(text, limit, keep_end=False):
+    """Mask secrets in at most `limit` characters of `text`. The text is cut
+    before the regex, so a large paste cannot block the event loop. A word cut
+    in two is dropped, so a cut secret cannot pass the mask."""
+    if len(text) > limit:
+        words = (text[-limit:].split(None, 1) if keep_end
+                 else text[:limit].rsplit(None, 1))
+        text = (words[-1] if keep_end else words[0]) if len(words) == 2 else ""
+    return SECRET_RE.sub("[redacted]", text)
+
+
+def user_text(message, limit=STATE_MAX_CHARS):
+    """Return the text that the user typed, without injected blocks."""
+    blocks = text_blocks(message)
+    for t in blocks:
+        if command := COMMAND_RE.search(t):
+            args = COMMAND_ARGS_RE.search(t)
+            args = args.group(1).strip() if args else ""
+            return redact(f"{command.group(1).strip()} {args}".strip(), limit)
+    parts = [t for t in blocks if not t.lstrip().startswith(INJECTED_PREFIXES)]
+    return redact("\n".join(parts), limit)
+
+
+def has_command(message):
+    return any(COMMAND_RE.search(t) for t in text_blocks(message))
+
+
+def turn_start(messages):
+    """Index of the first message of the new turn: the last user prompt, and
+    the message before it if that one has the tags of a slash command whose
+    body is the last prompt. Older prompts with no answer (an interrupted
+    turn, a local command and its output) go to the context."""
+    if not messages or not is_new_turn(messages[-1]):
+        return len(messages)
+    i = len(messages) - 1
+    if (i > 0 and is_new_turn(messages[i - 1]) and has_command(messages[i - 1])
+            and not has_command(messages[i])
+            and not any(t.lstrip().startswith("<local-command")
+                        for t in text_blocks(messages[i]))):
+        i -= 1
+    return i
+
+
+def context_text(messages):
+    """The earlier conversation for Jev, oldest first: the typed user text and
+    the end of each assistant answer. Tool calls and results stay out."""
+    lines, used = [], 0
+    for i in range(len(messages) - 1, -1, -1):
+        m = messages[i]
+        role = m.get("role") if isinstance(m, dict) else None
+        if role == "assistant":
+            # The end of an answer has the question it asks.
+            text = redact("\n".join(text_blocks(m)), CONTEXT_MSG_CHARS, keep_end=True)
+        elif is_new_turn(m):
+            if turn_start(messages[:i + 1]) < i:
+                continue   # the body of a slash command: its tags stand for it
+            text = user_text(m, CONTEXT_MSG_CHARS)
+        else:
+            continue
+        line = f"{role}: {' '.join(text.split())}"
+        if line == f"{role}: ":
+            continue
+        if used + len(line) > CONTEXT_MAX_CHARS:
+            break
+        lines.append(line)
+        used += len(line) + 1
+    return "\n".join(reversed(lines))
+
+
+def jev_request(text, context):
+    if not context:
+        return text
+    return (f"Earlier conversation, oldest first:\n{context}\n\n"
+            f"New request:\n{text}")
 
 
 def chat_messages(messages):
@@ -162,29 +256,52 @@ def conversation_key(messages, session_id=""):
     return hashlib.sha256(raw).hexdigest()[:16]
 
 
-def pick_tier(choice, confidence):
+def covering(order, probs):
+    """Return the smallest option in `order` whose probability, added from the
+    smallest option up, reaches COVERAGE. None if `probs` is not usable."""
+    if not isinstance(probs, dict):
+        return None
+    total = 0.0
+    for name in order:
+        p = probs.get(name, 0)
+        if not isinstance(p, (int, float)) or not 0 <= p <= 1:
+            return None
+        total += p
+        if total >= COVERAGE - 1e-9:
+            return name
+    return None
+
+
+def is_sure(confidence):
+    try:
+        return float(confidence) >= CONFIDENCE_MIN   # False for NaN
+    except (TypeError, ValueError):
+        return False
+
+
+def pick_tier(choice, confidence, probs=None):
     if not isinstance(choice, str) or choice not in MODELS:
         return FALLBACK_TIER
-    if confidence is None or not confidence >= CONFIDENCE_MIN:
-        return FALLBACK_TIER
-    return choice
+    if is_sure(confidence):
+        return choice
+    return covering(MODELS, probs) or FALLBACK_TIER
 
 
-def pick_effort(choice, confidence):
-    """Return the effort, or None when Jev is not sure."""
+def pick_effort(choice, confidence, probs=None):
+    """Return the effort, or None when Jev gives no usable answer."""
     if not isinstance(choice, str) or choice not in EFFORT_CRITERIA:
         return None
-    if not isinstance(confidence, (int, float)) or not confidence >= CONFIDENCE_MIN:
-        return None
-    return choice
+    if is_sure(confidence):
+        return choice
+    return covering(EFFORT_CRITERIA, probs)
 
 
-async def classify(session, api_key, text):
+async def classify(session, api_key, text, context=""):
     """Return (tier, effort, Jev answers). The answers are {} if TypeSafe
     failed, and the effort is then None."""
     payload = {
         "model": "jev-latest",
-        "state": {"request": text},
+        "state": {"request": jev_request(text, context)},
         "questions": {"tier": {"type": "choice",
                                "instructions": INSTRUCTIONS,
                                "criteria": CRITERIA},
@@ -217,8 +334,9 @@ async def classify(session, api_key, text):
     effort = None
     if isinstance(effort_answer, dict):
         effort = pick_effort(effort_answer.get("choice"),
-                             effort_answer.get("confidence"))
-    return pick_tier(choice, confidence), effort, answers
+                             effort_answer.get("confidence"),
+                             effort_answer.get("probabilities"))
+    return pick_tier(choice, confidence, answer.get("probabilities")), effort, answers
 
 
 async def route(app, body, session_id):
@@ -241,11 +359,15 @@ async def route(app, body, session_id):
 
     key = conversation_key(messages, session_id)
     sticky = app["sticky"]
-    text = user_text(messages[-1]) if is_new_turn(messages[-1]) else ""
+    start_at = turn_start(messages)
+    turn = [{"type": "text", "text": t}
+            for m in messages[start_at:] for t in text_blocks(m)]
+    text = user_text({"content": turn}) if start_at < len(messages) else ""
     if text.strip():
+        context = context_text(messages[:start_at])
         start = time.monotonic()
         tier, effort, answers = await classify(
-            app["session"], app["api_key"], text)
+            app["session"], app["api_key"], text, context)
         sticky[key] = {"model": MODELS[tier], "effort": effort or FALLBACK_EFFORT}
         sticky.move_to_end(key)
         while len(sticky) > STICKY_MAX:
@@ -258,6 +380,8 @@ async def route(app, body, session_id):
         log.info("route %s", json.dumps({
             "conv": key, "requested": original, "tier": tier,
             "jev": answer.get("choice"), "confidence": answer.get("confidence"),
+            "doubt": bool(answer) and not is_sure(answer.get("confidence")),
+            "context_chars": len(context),
             "probs": answer.get("probabilities"),
             "effort": effort or FALLBACK_EFFORT,
             "effort_default": effort is None,
@@ -486,6 +610,11 @@ def summarize(since):
     # Route lines from before the effort feature have no "effort" key.
     with_effort = [r for r in routes if "effort" in r]
     effort = Counter(r["effort"] for r in with_effort if r["effort"])
+    # Route lines from before the coverage rule have no "doubt" key. Then a
+    # doubt is a tier that differs from Jev's choice.
+    doubts = [r for r in routes if r.get("confidence") is not None
+              and r.get("doubt", r["tier"] != r.get("jev"))]
+    doubt_tiers = Counter(r["tier"] for r in doubts)
     return {
         "effort": {e: effort[e] for e in EFFORT_CRITERIA},
         "effort_default": sum(bool(r.get("effort_default")) for r in with_effort),
@@ -493,13 +622,14 @@ def summarize(since):
         "total": len(routes),
         "final": {t: final[t] for t in MODELS},
         "jev": {t: jev[t] for t in MODELS},
-        "doubts": [r for r in routes if r.get("confidence") is not None
-                   and r["tier"] != r.get("jev")],
+        "doubts": doubts,
+        "doubt_tiers": {t: doubt_tiers[t] for t in MODELS},
         "failed": sum(r.get("confidence") is None for r in routes),
         "rejects": rejects,
         "ms_median": ms[len(ms) // 2] if ms else None,
         "ms_max": ms[-1] if ms else None,
         "confidence_min": CONFIDENCE_MIN,
+        "coverage": COVERAGE,
         "fallback": FALLBACK_TIER,
     }
 
@@ -521,8 +651,10 @@ def stats(since, doubts_max):
         print("\nEsforço (effort) usado:")
         for name, n in s["effort"].items():
             print(f"  {name:<7}{n:>5}")
-        print(f"  padrão {FALLBACK_EFFORT}  {s['effort_default']:>3}  (dúvida ou falha do Jev)")
-    print(f"\nFoi para {FALLBACK_TIER} por dúvida (confiança < {CONFIDENCE_MIN}): {len(s['doubts'])}")
+        print(f"  padrão {FALLBACK_EFFORT}  {s['effort_default']:>3}  (falha do Jev)")
+    split = " · ".join(f"{t} {n}" for t, n in s["doubt_tiers"].items() if n)
+    print(f"\nDúvida do Jev (confiança < {CONFIDENCE_MIN}): {len(s['doubts'])}"
+          f"  decidida por cobertura de {COVERAGE:.0%}: {split or '-'}")
     print(f"Foi para {FALLBACK_TIER} por falha da TypeSafe: {s['failed']}")
     print(f"Rejeitado pela Anthropic (400) e reenviado sem roteamento: {s['rejects']}")
     if s["ms_median"] is not None:
@@ -533,7 +665,7 @@ def stats(since, doubts_max):
             probs = r.get("probs") or {}
             dist = " ".join(f"{k[0]}={probs[k]:.2f}" for k in MODELS if k in probs)
             print(f"  {r['ts']}  conf={r['confidence']:.2f}  "
-                  f"jev={r['jev']:<6} [{dist}]  {r.get('prompt', '')}")
+                  f"jev={r['jev']:<6} →{r['tier']:<6} [{dist}]  {r.get('prompt', '')}")
 
 
 def selftest():
@@ -555,7 +687,52 @@ def selftest():
     assert user_text({"content": ["x", 3, {"type": "text", "text": 5}]}) == ""
     assert user_text({"content": "This session is being continued..."}) == ""
     assert user_text({"content": "[SUGGESTION MODE: Suggest what to do next"}) == ""
-    assert len(user_text({"content": "x" * 9000})) == STATE_MAX_CHARS
+    assert STATE_MAX_CHARS - 4 <= len(user_text({"content": "x " * 9000})) <= STATE_MAX_CHARS
+    assert user_text({"content": "x" * 9000}) == ""   # one cut word: dropped
+    command = {"role": "user", "content": [
+        {"type": "text", "text": "<command-message>ecc:plan</command-message>\n"
+                                 "<command-name>/ecc:plan</command-name>\n"
+                                 "<command-args>add login</command-args>"},
+        {"type": "text", "text": "# Plan Command\nRestate the requirements..."}]}
+    assert user_text(command) == "/ecc:plan add login"
+    assert user_text({"content": "Base directory for this skill: /x\n# Skill"}) == ""
+    body = {"role": "user", "content": "# Plan Command\nRestate..."}
+    tags = {"role": "user", "content": command["content"][:1]}
+    assistant = {"role": "assistant", "content": [
+        {"type": "thinking", "thinking": "secret plan"},
+        {"type": "text", "text": "Done. Do you want all three? token=abc123"},
+        {"type": "tool_use", "id": "t", "name": "Bash", "input": {}}]}
+    assert turn_start([prompt, assistant, tags, body]) == 2
+    assert turn_start([prompt, tool_result]) == 2
+    # A local command (/model) and its output, then a new prompt: only the
+    # new prompt is the turn.
+    stdout = {"role": "user", "content": "<local-command-stdout>Set model</local-command-stdout>"}
+    new = {"role": "user", "content": "refactor auth to OAuth"}
+    assert turn_start([prompt, assistant, tags, stdout, new]) == 4
+    assert turn_start([prompt, assistant, tags, stdout]) == 3
+    # An interrupted prompt goes to the context, not into the new request.
+    assert turn_start([prompt, {"role": "user", "content": "x" * 1600}, new]) == 2
+    assert is_sure("0.9") and not is_sure("x") and not is_sure(None)
+    assert user_text({"content": "<bash-input>cat .env</bash-input>"}) == ""
+    assert user_text({"content": "<bash-stdout>API=1</bash-stdout>"}) == ""
+    leaks = ['"password": "hunter2"', "DATABASE_URL=postgres://u:hunter2@h/db",
+             "pass=hunter2", "-----BEGIN RSA PRIVATE KEY-----\nMIIhunter2"]
+    for leak in leaks:
+        assert "hunter2" not in user_text({"content": leak}), leak
+    # A secret cut by the limit is dropped, not half sent.
+    assert user_text({"content": "ok sk-" + "a" * 30}, 20) == "ok"
+    assert redact("a sk-" + "b" * 30 + " end", 12, keep_end=True) == "end"
+    started = time.monotonic()
+    user_text({"content": "key" * 200000 + "<command-name>" * 20000})
+    assert time.monotonic() - started < 1, "slow regex on a large paste"
+    # The body of an earlier slash command does not go to the context.
+    assert context_text([tags, body, assistant]).startswith("user: /ecc:plan add login\nassistant:")
+    ctx = context_text([prompt, assistant, tool_result])
+    assert ctx == "user: rename foo to bar\nassistant: Done. Do you want all three? [redacted]", ctx
+    long_ctx = context_text([{"role": "assistant", "content": "x " * 9000}] * 9)
+    assert len(long_ctx) <= CONTEXT_MAX_CHARS and long_ctx.count("assistant: ") == 3, len(long_ctx)
+    assert jev_request("yes", "") == "yes"
+    assert jev_request("yes", "assistant: ok?").endswith("New request:\nyes")
     secret = user_text({"content": "use sk-ant-abcdefghijklmnopqrstuvwxyz "
                                    "and API_KEY=hunter2"})
     assert "sk-ant" not in secret and "hunter2" not in secret, secret
@@ -575,6 +752,16 @@ def selftest():
     assert pick_tier("unknown", 0.9) == FALLBACK_TIER
     assert pick_tier(["haiku"], 0.9) == FALLBACK_TIER
     assert pick_tier("sonnet", None) == FALLBACK_TIER
+    # Not sure: the smallest tier that covers COVERAGE (0.8 in the tests).
+    unsure = {"haiku": 0.48, "sonnet": 0.44, "opus": 0.08}
+    assert pick_tier("haiku", 0.22, unsure) == "sonnet"
+    assert pick_tier("sonnet", 0.4, {"haiku": 0.3, "sonnet": 0.48, "opus": 0.22}) == "opus"
+    assert pick_tier("haiku", 0.4, {"haiku": "x"}) == FALLBACK_TIER
+    assert pick_tier("haiku", 0.4, {"haiku": float("nan")}) == FALLBACK_TIER
+    assert pick_tier("haiku", 0.4, {"haiku": 0.1}) == FALLBACK_TIER
+    assert pick_tier("haiku", 0.9, unsure) == "haiku"
+    assert pick_effort("low", 0.3, {"low": 0.46, "medium": 0.41}) == "medium"
+    assert pick_effort("low", 0.3, None) is None
     assert pick_effort("low", 0.9) == "low"
     assert pick_effort("max", CONFIDENCE_MIN) == "max"
     assert pick_effort("low", CONFIDENCE_MIN - 0.01) is None
@@ -632,7 +819,8 @@ def selftest_route(prompt, tool_result):
     real, answers = classify, {"tier": {"choice": "sonnet", "confidence": 0.9}}
     picked = {}
 
-    async def fake(session, api_key, text):
+    async def fake(session, api_key, text, context=""):
+        picked["seen"] = (text, context)
         return picked["tier"], picked["effort"], answers
 
     def body(messages):
@@ -656,6 +844,11 @@ def selftest_route(prompt, tool_result):
         # The tool-result request of the same turn reuses the stored choice.
         out = asyncio.run(run([prompt, tool_result], app))
         assert out["model"] == MODELS["sonnet"] and out["output_config"]["effort"] == "low"
+        # A short reply: Jev gets the earlier conversation as context.
+        answer = {"role": "assistant", "content": [{"type": "text", "text": "All three?"}]}
+        app = {"sticky": OrderedDict(), "session": None, "api_key": "k"}
+        asyncio.run(run([prompt, answer, {"role": "user", "content": "yes"}], app))
+        assert picked["seen"] == ("yes", "user: rename foo to bar\nassistant: All three?"), picked
         # Not sure about the effort: use the default, not the effort Claude Code sent.
         app = {"sticky": OrderedDict(), "session": None, "api_key": "k"}
         picked.update(tier="sonnet", effort=None)

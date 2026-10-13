@@ -43,7 +43,9 @@ Se um download falhar por rede, é política do sandbox, não falta de conectivi
 Se o sandbox subiu com `model_router=on` e há chave da TypeSafe, as requisições
 do Claude passam por um roteador local (`127.0.0.1:8788`). A cada mensagem sua,
 o Jev (TypeSafe) escolhe o modelo (Haiku, Sonnet ou Opus) e o esforço (`low` a
-`max`). Com dúvida ou falha da TypeSafe, o roteador usa Opus e `high`.
+`max`). O Jev também vê o fim da conversa anterior. Com dúvida, o roteador usa o
+menor modelo que soma 80% da probabilidade. Com falha da TypeSafe, ele usa Opus e
+`high`.
 
 - O comando `/router` abre um painel com os turnos por modelo, o esforço e os
   fallbacks.

@@ -113,7 +113,7 @@ worktrees, sessões paralelas) — ambos na lista.
 | `copy_from_host` | *(vazio)* | lista por vírgula | Arquivos ignorados pelo git a copiar do repo do host (só com `--clone`) |
 | `disabled_hooks` | *(vazio)* | IDs minúsculos por vírgula | `ECC_DISABLED_HOOKS` |
 | `model_router` | `on` | `on`, `off` | Liga o roteador de modelos (precisa do secret `TYPESAFE_API_KEY`) |
-| `router_confidence_min` | `0.5` | número de 0 a 1 | `ROUTER_CONFIDENCE_MIN`: abaixo dela, o roteador usa opus e `high` |
+| `router_confidence_min` | `0.5` | número de 0 a 1 | `ROUTER_CONFIDENCE_MIN`: abaixo dela, o roteador usa o menor modelo que soma 80% da probabilidade |
 
 Todo arg interpolado em comando tem `enum` ou `pattern` — a substituição
 `${{ kit.args.X }}` é textual e roda antes do parse do YAML, então a restrição é
@@ -233,8 +233,9 @@ repo sujo. Em trabalho exploratório isso pode incomodar — nesse caso,
 
 O kit traz o `claude-model-router` de [`model-router/`](../../../model-router/).
 A cada mensagem sua, o Jev (TypeSafe) escolhe o modelo (Haiku, Sonnet ou Opus) e
-o esforço (`low` a `max`). Com dúvida ou falha da TypeSafe, o roteador usa opus e
-`high`.
+o esforço (`low` a `max`). O Jev também vê o fim da conversa anterior. Com dúvida,
+o roteador usa o menor modelo que soma 80% da probabilidade. Com falha da TypeSafe,
+ele usa opus e `high`. Detalhes no [README do roteador](../../../model-router/README.md).
 
 ```
 claude -> claude-model-router (127.0.0.1:8788) -> proxy do sbx -> api.anthropic.com

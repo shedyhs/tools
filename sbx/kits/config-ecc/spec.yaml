@@ -56,7 +56,7 @@ args:
     enum: ["on", "off"]
   router_confidence_min:
     default: "0.5"
-    description: Confianca minima do Jev (ROUTER_CONFIDENCE_MIN). Abaixo dela, o roteador usa opus e high
+    description: Confianca minima do Jev (ROUTER_CONFIDENCE_MIN). Abaixo dela, o roteador usa o menor modelo que soma 80% da probabilidade
     pattern: '^(0(\.[0-9]+)?|1(\.0+)?)$'
 
 environment:
