@@ -4,7 +4,10 @@ Sandbox kit do `sbx` que sobe o Claude Code com um **ECC seletivo** (lista curad
 de skills + agentes + comandos), os **hooks do ECC ativos** e o **glab** pronto
 para o GitLab da PMMT. Desde a versão 0.2.0, o kit também traz o **roteador de
 modelos** (o Jev escolhe modelo e esforço), o **painel `/router`** e as **regras
-de escrita técnica** (STE e português técnico simplificado).
+de escrita técnica** (STE e português técnico simplificado). Desde a 0.3.0, o
+kit traz os **plugins e mods do host** (ponytail, i-have-adhd, answer-pane,
+context-bar, output-diet, skill-diet), fixa o Claude Code na versão do host e usa
+o ECC 2.2.3.
 
 ## Uso
 
@@ -102,7 +105,8 @@ worktrees, sessões paralelas) — ambos na lista.
 
 | Arg | Default | Valores | Efeito |
 |---|---|---|---|
-| `ecc_ref` | `v2.1.0` | tag `vX.Y.Z` | Tag do repositório ECC clonada |
+| `ecc_ref` | `v2.2.3` | tag `vX.Y.Z` | Tag do repositório ECC clonada |
+| `claude_version` | `2.1.301` | `X.Y.Z` | Versão do Claude Code (`claude install`). Os mods exigem 2.1.301 ou mais nova |
 | `hook_profile` | `standard` | `minimal`, `standard`, `strict` | `ECC_HOOK_PROFILE` |
 | `gateguard` | `on` | `on`, `off` | `ECC_GATEGUARD` |
 | `glab_version` | `1.117.0` | `X.Y.Z` | Versão do GitLab CLI |
@@ -125,11 +129,15 @@ o que impede injeção de shell no `setup.install`.
    `/home/agent/.ecc/ECC`, com tag + SHA gravados em `installed-ref`. Trocar de
    tag refaz o clone; nada é ignorado em silêncio.
 2. **Instalação seletiva.** `install-apply.js --target claude --modules
-   hooks-runtime --skills <lista>` popula `~/.claude/{skills,agents,commands,rules,scripts,hooks}`.
-3. **Hooks ativados.** O instalador resolve os hooks em
-   `~/.claude/hooks/hooks.json` — caminho que o Claude Code **não lê sozinho**.
-   O kit transplanta esse bloco para `/home/agent/.config/claude/ecc.json`, que
-   entra via `--settings` no `sandbox.command`. Falha alto se o bloco vier vazio.
+   hooks-runtime --skills <lista> --enable-hooks` popula
+   `~/.claude/{skills,agents,commands,rules,scripts,hooks}`. O ECC 2.2 exige as
+   deps npm de produção, então o clone roda `npm ci --omit=dev`.
+3. **Hooks ativados.** O ECC 2.2 mescla os hooks no `~/.claude/settings.json`,
+   que pertence ao kit `claude`. O kit guarda uma cópia em
+   `~/.ecc/settings.ecc.json` e devolve o `settings.json` ao estado anterior.
+   Depois, transplanta o bloco para `/home/agent/.config/claude/ecc.json`, que
+   entra via `--settings` no `sandbox.command`. Com `ecc_ref` anterior à 2.2, a
+   fonte é `~/.claude/hooks/hooks.json`. Falha alto se o bloco vier vazio.
 4. **glab** com SHA256 conferido contra o `checksums.txt` da release.
 5. **Identidade git** — sem ela o `git commit` falha, e o sandbox vem sem.
 6. **Auth GitLab por HTTPS** via `glab auth git-credential` como credential
@@ -141,6 +149,21 @@ o que impede injeção de shell no `setup.install`.
 9. **Escrita técnica:** as skills `asd-ste100` e `portugues-tecnico-simplificado`
    e a seção de escrita do `CLAUDE.md`. O idioma do Claude fica em `pt-BR`
    (`language` no `ecc.json`).
+10. **Plugins e mods do host** em `~/.local/share/claude-plugins/<nome>`. Um
+    segundo `--plugin-dir` aponta para a pasta, e o Claude carrega cada
+    subpasta. A cópia sai de `~/.claude/plugins/cache/` sem `.git`, `tests`,
+    `benchmarks`, `evals` e `node_modules`. O plugin `ecc` fica de fora, porque o
+    kit já instala o ECC (item 2). O `typesafe` também fica de fora, porque está
+    desligado no host.
+11. **Skills extras do host:** `archify`, `archify-review`,
+    `logging-best-practices` e `migrar-app-entre-namespaces`. A
+    `create-sbx-kit` fica de fora: o `sbx kit validate` lê `${{ kit.args.<nome> }}`
+    na documentação dela como placeholder e rejeita o kit. A `jev-model-router` é
+    o hook do roteador no host, e o kit já tem o seu.
+
+Para atualizar a partir do host, copie de novo os itens 10 e 11 e o
+`statusline-command.sh`, e ajuste `ecc_ref` e `claude_version`. Depois, rode
+`sbx kit validate` e recrie um sandbox do zero.
 
 ## Rules
 
@@ -276,8 +299,10 @@ fica em `~/.local/share/claude-router-view` e entra pelo `--plugin-dir` no
 `sandbox.command`. O comando `/router` abre o painel. Ele mostra os agentes
 ativos e as estatísticas do dia, lidas do `claude-model-router --stats-json`.
 
-O Claude Code da imagem (2.1.280) só carrega mods com painel quando
-`CLAUDE_CODE_ENABLE_FUNCTION_HOOKS=1`. O kit define essa variável. O kit leva só
+O Claude Code do sandbox só carrega mods com painel quando
+`CLAUDE_CODE_ENABLE_FUNCTION_HOOKS=1`. A imagem base vem com a 2.1.280, que
+rejeita a API de mods do answer-pane, do context-bar e do output-diet. Por isso
+o kit instala a versão do arg `claude_version`. O kit define essa variável. O kit leva só
 os arquivos que rodam (manifesto, `hooks.json`, `register.tsx` e `view.ts`). Os
 testes ficam no repositório.
 
@@ -387,22 +412,24 @@ Roteador e painel, sandbox criado do zero com `sbx v0.46.0` (Claude Code
   `ecc:planner`. Regras que assumem o namespace do plugin não valem aqui.
 - **156 skills, não 50.** A baseline do instalador entra junto; cortar mais
   exige `--without`.
-- Dependências npm do ECC (`ajv`, `sql.js`, `@iarna/toml`) não são instaladas —
-  os hooks só usam módulos nativos do Node. Para `ecc status`/`doctor`/`memory`:
-  `cd /home/agent/.ecc/ECC && npm ci --omit=dev` (exige `registry.npmjs.org:443`).
 - `setup.install` roda a cada criação e não é cacheado. Para eliminar o custo,
   asse clone + install numa imagem de template (`sbx template`).
 - O kit replica só parte da config pessoal do host: a seção de escrita do
-  `CLAUDE.md`, as duas skills de escrita e o `language`. Settings, MCP e
-  plugins ficam de fora. Para isso existe `~/.claude/sbx-sync-config.sh`, que
-  gera `claude-ecc:latest`.
+  `CLAUDE.md`, as skills e os plugins listados, a statusline e o `language`.
+  Settings e MCP ficam de fora. Para isso existe `~/.claude/sbx-sync-config.sh`,
+  que gera `claude-ecc:latest`.
+- Os plugins são uma cópia fixa. Uma atualização no host não chega ao kit até
+  você copiar de novo (veja o fim de [O que o kit entrega](#o-que-o-kit-entrega)).
 - **Jev com a chave real não foi testado no sandbox.** O teste usou uma chave
   falsa. A troca do placeholder pelo proxy é o mesmo mecanismo do
   `GITLAB_TOKEN`, que foi verificado.
 - **O painel não foi visto na tela do sandbox.** O mod carrega e o `/router`
   responde em modo `-p`, mas o desenho do painel só foi visto no host.
-- Os mods com painel são early access no Claude Code 2.1.280. Uma versão nova da
-  imagem pode mudar a API ou dispensar `CLAUDE_CODE_ENABLE_FUNCTION_HOOKS`.
+- Os mods com painel são early access no Claude Code. Uma versão nova pode mudar
+  a API ou dispensar `CLAUDE_CODE_ENABLE_FUNCTION_HOOKS`.
+- **O painel dos mods novos não foi visto na tela do sandbox.** O teste da 0.3.0
+  confirmou que os 7 plugins carregam (evento `init` do `claude -p`), mas não
+  abriu uma sessão interativa autenticada.
 
 ## Referências
 
