@@ -1,9 +1,9 @@
 schemaVersion: "2"
 kind: sandbox
 name: config-ecc
-version: "0.2.0"
-displayName: Claude Code + ECC seletivo + glab + roteador de modelos
-description: Claude Code com ECC seletivo (skills curadas, agentes, comandos e rules), hooks do ECC ativos, glab configurado, roteador de modelos (Jev/TypeSafe) com painel /router e skills de escrita STE
+version: "0.3.0"
+displayName: Claude Code + ECC seletivo + glab + roteador de modelos + mods
+description: Claude Code com ECC seletivo (skills curadas, agentes, comandos e rules), hooks do ECC ativos, glab configurado, roteador de modelos (Jev/TypeSafe) com painel /router, plugins e mods do host e skills de escrita STE
 extends: claude
 sourceURL: https://github.com/affaan-m/ECC
 licenses:
@@ -11,9 +11,13 @@ licenses:
 
 args:
   ecc_ref:
-    default: "v2.1.0"
+    default: "v2.2.3"
     description: Tag do repositorio ECC clonada no sandbox
     pattern: '^v[0-9]+\.[0-9]+\.[0-9]+$'
+  claude_version:
+    default: "2.1.301"
+    description: Versao do Claude Code no sandbox. Os mods (answer-pane, context-bar, output-diet) exigem a API de mods >= 2.1.301
+    pattern: '^[0-9]+\.[0-9]+\.[0-9]+$'
   hook_profile:
     default: "standard"
     description: Rigor dos hooks do ECC (ECC_HOOK_PROFILE)
@@ -82,8 +86,9 @@ sandbox:
     - --dangerously-skip-permissions
     - --settings
     - /home/agent/.config/claude/ecc.json
+    # Pasta de plugins: o Claude carrega cada subpasta (ponytail, i-have-adhd, mods).
     - --plugin-dir
-    - /home/agent/.local/share/claude-router-view
+    - /home/agent/.local/share/claude-plugins
 
 permissions:
   network:
@@ -106,6 +111,14 @@ setup:
 
     - command: |
         set -eu
+        V="${{ kit.args.claude_version }}"
+        [ "$(claude --version | cut -d" " -f1)" = "$V" ] || claude install "$V"
+        [ "$(claude --version | cut -d" " -f1)" = "$V" ] || { echo "ERRO: claude $V nao instalou" >&2; exit 1; }
+      user: "1000"
+      description: Fixar a versao do Claude Code (a imagem base pode vir atrasada)
+
+    - command: |
+        set -eu
         DEST=/home/agent/.ecc/ECC
         STAMP=/home/agent/.ecc/installed-ref
         REF="${{ kit.args.ecc_ref }}"
@@ -115,6 +128,8 @@ setup:
         fi
         rm -rf "$DEST"
         git clone --depth 1 --branch "$REF" https://github.com/affaan-m/ECC.git "$DEST"
+        # ECC >= 2.2 exige as deps de producao (sql.js etc.) no install-apply.
+        (cd "$DEST" && npm ci --omit=dev --no-audit --no-fund --loglevel=error)
         printf "%s %s\n" "$REF" "$(git -C "$DEST" rev-parse HEAD)" > "$STAMP"
       user: "1000"
       description: Clonar ECC na tag fixada
@@ -122,8 +137,20 @@ setup:
     - command: |
         set -eu
         SK=$(tr -d "[:space:]" < /home/agent/.ecc-skills)
+        S=/home/agent/.claude/settings.json
+        OUT=/home/agent/.ecc/settings.ecc.json
+        # ECC >= 2.2 exige --enable-hooks e mescla os hooks no settings.json, que e do kit claude.
+        # O resultado vai para $OUT e o settings.json volta ao estado anterior.
+        FLAG=""
+        if grep -rqF -- "--enable-hooks" /home/agent/.ecc/ECC/scripts; then FLAG=--enable-hooks; fi
+        rm -f "$OUT" /tmp/settings.pre-ecc.json
+        if [ -f "$S" ]; then cp "$S" /tmp/settings.pre-ecc.json; fi
+        RC=0
         node /home/agent/.ecc/ECC/scripts/install-apply.js \
-          --target claude --modules hooks-runtime --skills "$SK"
+          --target claude --modules hooks-runtime --skills "$SK" $FLAG || RC=$?
+        if [ "$RC" -eq 0 ] && [ -f "$S" ]; then cp "$S" "$OUT"; fi
+        if [ -f /tmp/settings.pre-ecc.json ]; then mv /tmp/settings.pre-ecc.json "$S"; else rm -f "$S"; fi
+        exit "$RC"
       user: "1000"
       description: Instalar ECC seletivo (skills da lista + hooks runtime)
 
@@ -132,11 +159,15 @@ setup:
         mkdir -p /home/agent/.config/claude
         node -e '
           const fs = require("fs");
-          const src = "/home/agent/.claude/hooks/hooks.json";
-          const h = JSON.parse(fs.readFileSync(src, "utf8"));
-          if (!h.hooks || !Object.keys(h.hooks).length) {
-            throw new Error("ECC nao instalou hooks em " + src);
+          // ECC >= 2.2 grava os hooks no settings.json (copiado para settings.ecc.json). Antes, em hooks/hooks.json.
+          const src = [
+            "/home/agent/.ecc/settings.ecc.json",
+            "/home/agent/.claude/hooks/hooks.json"
+          ].find((f) => fs.existsSync(f) && Object.keys(JSON.parse(fs.readFileSync(f, "utf8")).hooks || {}).length);
+          if (!src) {
+            throw new Error("ECC nao instalou hooks (settings.ecc.json nem hooks/hooks.json)");
           }
+          const h = JSON.parse(fs.readFileSync(src, "utf8"));
           h.hooks.Stop = (h.hooks.Stop || []).concat({
             hooks: [{
               type: "command",

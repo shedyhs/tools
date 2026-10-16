@@ -17,6 +17,7 @@ reset='\033[0m'
 # and shift every field left whenever a value is absent. `join` renders null as
 # an empty field, which matches the `// empty` guards this used to do.
 IFS=$'\x1f' read -r cwd model_name ctx_used ctx_tokens five_h_pct five_h_resets seven_d_pct seven_d_resets \
+                    transcript \
   < <(jq -r '[
         (.workspace.current_dir // .cwd // ""),
         .model.display_name,
@@ -25,7 +26,8 @@ IFS=$'\x1f' read -r cwd model_name ctx_used ctx_tokens five_h_pct five_h_resets 
         .rate_limits.five_hour.used_percentage,
         .rate_limits.five_hour.resets_at,
         .rate_limits.seven_day.used_percentage,
-        .rate_limits.seven_day.resets_at
+        .rate_limits.seven_day.resets_at,
+        .transcript_path
       ] | join("\u001f")')
 
 dir_basename=${cwd##*/}
@@ -121,6 +123,37 @@ if [ -n "$ctx_used" ]; then
   fi
 fi
 
+# Token throughput of the latest reply — output tokens over the wall-clock gap
+# between the request (the entry before it) and the reply's last line.
+# Only the tail is read, so cost stays flat no matter how long the session runs.
+# awk, not jq: ~15x faster, and this reruns on every refresh.
+tps_info=""
+if [ -s "$transcript" ]; then
+  tps=$(tail -n 40 "$transcript" | awk '
+    # Wall-clock seconds within the day; rollover is corrected below.
+    function secs(iso,   p) { p = index(iso, "T")
+      return substr(iso,p+1,2)*3600 + substr(iso,p+4,2)*60 + substr(iso,p+7,6) }
+    {
+      if (!match($0, /"timestamp":"[^"]*"/)) next
+      n++
+      ts[n]  = secs(substr($0, RSTART+13, RLENGTH-14))
+      ty[n]  = ($0 ~ /"type":"assistant"/) ? "a" : "o"
+      tok[n] = match($0, /"output_tokens":[0-9]+/) ? substr($0, RSTART+16, RLENGTH-16) : 0
+    }
+    END {
+      i = n
+      while (i > 0 && ty[i] != "a") i--                      # skip trailing tool results
+      if (i < 2 || tok[i] == 0) exit
+      j = i - 1
+      while (j > 0 && ty[j] == "a" && tok[j] == tok[i]) j--  # one reply spans several lines
+      if (j < 1) exit
+      d = ts[i] - ts[j]
+      if (d < 0) d += 86400
+      if (d > 0.3) printf "%d\n", tok[i] / d
+    }')
+  [ -n "$tps" ] && printf -v tps_info "  ${blue}%s tok/s${reset}" "$tps"
+fi
+
 # 5-hour usage — percentage + countdown to reset (absent for non-subscribers or before first API response)
 five_h_info=""
 if [ -n "$five_h_pct" ]; then
@@ -154,5 +187,5 @@ if [ -n "$model_name" ]; then
   printf -v model_info "  ${green}%s${reset}" "$model_name"
 fi
 
-printf "${green}${reset}  ${cyan}%s${reset}%s%s%s%s%s%s\n" \
-  "$dir_basename" "$git_info" "$wt_info" "$ctx_info" "$five_h_info" "$seven_d_info" "$model_info"
+printf "${green}${reset}  ${cyan}%s${reset}%s%s%s%s%s%s%s\n" \
+  "$dir_basename" "$git_info" "$wt_info" "$ctx_info" "$tps_info" "$five_h_info" "$seven_d_info" "$model_info"
