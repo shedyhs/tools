@@ -3,7 +3,7 @@
 Sandbox kit do `sbx` que sobe o Claude Code com um **ECC seletivo** (lista curada
 de skills + agentes + comandos), os **hooks do ECC ativos** e o **glab** pronto
 para o GitLab da PMMT. Desde a versão 0.2.0, o kit também traz o **roteador de
-modelos** (o Jev escolhe modelo e esforço), o **painel `/router`** e as **regras
+modelos** (o Jev escolhe modelo e esforço) e as **regras
 de escrita técnica** (STE e português técnico simplificado). Desde a 0.3.0, o
 kit traz os **plugins e mods do host** (ponytail, i-have-adhd, answer-pane,
 context-bar, output-diet, skill-diet), fixa o Claude Code na versão do host e usa
@@ -144,18 +144,16 @@ o que impede injeção de shell no `setup.install`.
    helper.
 7. **Roteador de modelos** (`~/.local/bin/claude-model-router`), iniciado pelo
    entrypoint `claude-routed`. Veja [Roteador de modelos](#roteador-de-modelos).
-8. **Painel `/router`**, um mod do Claude Code em
-   `~/.local/share/claude-router-view`, carregado com `--plugin-dir`.
-9. **Escrita técnica:** as skills `asd-ste100` e `portugues-tecnico-simplificado`
+8. **Escrita técnica:** as skills `asd-ste100` e `portugues-tecnico-simplificado`
    e a seção de escrita do `CLAUDE.md`. O idioma do Claude fica em `pt-BR`
    (`language` no `ecc.json`).
-10. **Plugins e mods do host** em `~/.local/share/claude-plugins/<nome>`. Um
+9. **Plugins e mods do host** em `~/.local/share/claude-plugins/<nome>`. Um
     segundo `--plugin-dir` aponta para a pasta, e o Claude carrega cada
     subpasta. A cópia sai de `~/.claude/plugins/cache/` sem `.git`, `tests`,
     `benchmarks`, `evals` e `node_modules`. O plugin `ecc` fica de fora, porque o
     kit já instala o ECC (item 2). O `typesafe` também fica de fora, porque está
     desligado no host.
-11. **Skills extras do host:** `archify`, `archify-review`,
+10. **Skills extras do host:** `archify`, `archify-review`,
     `logging-best-practices` e `migrar-app-entre-namespaces`. A
     `create-sbx-kit` fica de fora: o `sbx kit validate` lê `${{ kit.args.<nome> }}`
     na documentação dela como placeholder e rejeita o kit. A `jev-model-router` é
@@ -292,19 +290,12 @@ O script e o lockfile do kit são cópias dos de `model-router/`. Se você mudar
 script, rode `uv lock --script claude-model-router`, copie os dois arquivos para
 `files/home/.local/bin/` e confira com `cmp`.
 
-## Painel /router
-
-O mod `router-view` de [`model-router/router-view/`](../../../model-router/router-view/)
-fica em `~/.local/share/claude-router-view` e entra pelo `--plugin-dir` no
-`sandbox.command`. O comando `/router` abre o painel. Ele mostra os agentes
-ativos e as estatísticas do dia, lidas do `claude-model-router --stats-json`.
+## Mods com painel
 
 O Claude Code do sandbox só carrega mods com painel quando
 `CLAUDE_CODE_ENABLE_FUNCTION_HOOKS=1`. A imagem base vem com a 2.1.280, que
 rejeita a API de mods do answer-pane, do context-bar e do output-diet. Por isso
-o kit instala a versão do arg `claude_version`. O kit define essa variável. O kit leva só
-os arquivos que rodam (manifesto, `hooks.json`, `register.tsx` e `view.ts`). Os
-testes ficam no repositório.
+o kit instala a versão do arg `claude_version`. O kit define essa variável.
 
 ## Autenticação no GitLab
 
@@ -401,7 +392,6 @@ Roteador e painel, sandbox criado do zero com `sbx v0.46.0` (Claude Code
 - **porta ocupada por outro serviço:** o entrypoint espera 15 s, avisa e roda o
   Claude direto;
 - uma segunda execução do entrypoint não sobe um segundo roteador;
-- `claude --plugin-dir ... -p "/router"` responde `Model router pane opened.`;
 - o `policy log` só mostra liberados `api.anthropic.com`, `api.typesafe.ai` e
   `files.pythonhosted.org` para o roteador.
 
@@ -423,8 +413,6 @@ Roteador e painel, sandbox criado do zero com `sbx v0.46.0` (Claude Code
 - **Jev com a chave real não foi testado no sandbox.** O teste usou uma chave
   falsa. A troca do placeholder pelo proxy é o mesmo mecanismo do
   `GITLAB_TOKEN`, que foi verificado.
-- **O painel não foi visto na tela do sandbox.** O mod carrega e o `/router`
-  responde em modo `-p`, mas o desenho do painel só foi visto no host.
 - Os mods com painel são early access no Claude Code. Uma versão nova pode mudar
   a API ou dispensar `CLAUDE_CODE_ENABLE_FUNCTION_HOOKS`.
 - **O painel dos mods novos não foi visto na tela do sandbox.** O teste da 0.3.0
