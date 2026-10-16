@@ -252,11 +252,11 @@ repo sujo. Em trabalho exploratório isso pode incomodar — nesse caso,
 
 ## Roteador de modelos
 
-O kit traz o `claude-model-router` de [`model-router/`](../../../model-router/).
+O kit traz o `claude-model-router`. Os fontes do roteador saíram de `model-router/` em um commit posterior, e o histórico do git ainda os tem (`760a1ba`).
 A cada mensagem sua, o Jev (TypeSafe) escolhe o modelo (Haiku, Sonnet ou Opus) e
 o esforço (`low` a `max`). O Jev também vê o fim da conversa anterior. Com dúvida,
 o roteador usa o menor modelo que soma 80% da probabilidade. Com falha da TypeSafe,
-ele usa opus e `high`. Detalhes no [README do roteador](../../../model-router/README.md).
+ele usa opus e `high`. Detalhes no README do roteador, em `760a1ba:model-router/README.md`.
 
 ```
 claude -> claude-model-router (127.0.0.1:8788) -> proxy do sbx -> api.anthropic.com
@@ -286,7 +286,7 @@ Diferenças em relação ao host:
   estão liberados na rede. As versões e os hashes vêm do lockfile
   `claude-model-router.lock`, e o `uv run --locked` recusa qualquer diferença.
 
-O script e o lockfile do kit são cópias dos de `model-router/`. Se você mudar o
+O script e o lockfile do kit são cópias das versões de `760a1ba:model-router/`. Se você mudar o
 script, rode `uv lock --script claude-model-router`, copie os dois arquivos para
 `files/home/.local/bin/` e confira com `cmp`.
 
