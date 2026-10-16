@@ -86,8 +86,6 @@ sandbox:
     - --dangerously-skip-permissions
     - --settings
     - /home/agent/.config/claude/ecc.json
-    - --plugin-dir
-    - /home/agent/.local/share/claude-router-view
     # Pasta de plugins: o Claude carrega cada subpasta (ponytail, i-have-adhd, mods).
     - --plugin-dir
     - /home/agent/.local/share/claude-plugins
