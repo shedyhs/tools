@@ -1,7 +1,7 @@
 schemaVersion: "2"
 kind: sandbox
 name: config-ecc
-version: "0.3.0"
+version: "0.4.0"
 displayName: Claude Code + ECC seletivo + glab + roteador de modelos + mods
 description: Claude Code com ECC seletivo (skills curadas, agentes, comandos e rules), hooks do ECC ativos, glab configurado, roteador de modelos (Jev/TypeSafe) com painel /router, plugins e mods do host e skills de escrita STE
 extends: claude
@@ -48,8 +48,12 @@ args:
     enum: [off, warn, block]
   copy_from_host:
     default: ""
-    description: Arquivos ignorados pelo git a copiar do repo do host para o workspace (so com --clone). Ex, .env,certs
+    description: Arquivos ignorados pelo git a copiar do repo do host para o workspace (com --clone ou multi_repo_source). Ex, .env,certs
     pattern: '([^,[:space:]]+(,[^,[:space:]]+)*)?'
+  multi_repo_source:
+    default: ""
+    description: Pasta do host com varios repos git, montada read-only. O startup clona cada subrepo no workspace primario. Vazio = desligado
+    pattern: '^(/[^,:\n]*)?$'
   disabled_hooks:
     default: ""
     description: Lista separada por virgula de IDs de hook do ECC a desligar (ECC_DISABLED_HOOKS)
@@ -71,6 +75,7 @@ environment:
     GITLAB_HOST: "${{ kit.args.gitlab_host }}"
     KIT_DIRTY_GUARD: "${{ kit.args.dirty_guard }}"
     KIT_COPY_FROM_HOST: "${{ kit.args.copy_from_host }}"
+    KIT_MULTI_REPO_SOURCE: "${{ kit.args.multi_repo_source }}"
     KIT_MODEL_ROUTER: "${{ kit.args.model_router }}"
     ROUTER_CONFIDENCE_MIN: "${{ kit.args.router_confidence_min }}"
     # O sandbox nao tem journald: o roteador grava o log aqui e o --stats le daqui.
@@ -93,7 +98,8 @@ sandbox:
 permissions:
   network:
     allow:
-      - "github.com:443"                       # clone do ECC
+      - "github.com:443"                       # clone do ECC, git do gh
+      - "api.github.com:443"                   # API do gh
       - "gitlab.com:443"                       # release do glab
       - "registry.npmjs.org:443"               # deps da skill qrcode-otp
       - "deb.debian.org:443"                   # update do debian quando levanta o container
@@ -245,8 +251,12 @@ setup:
         fi
         git config --global "credential.https://${HOST}.helper" "!glab auth git-credential"
         glab config set --host "$HOST" git_protocol https
+        # GitHub: o GH_TOKEN do sandbox e um placeholder, e o proxy troca pelo
+        # token real do secret "github" do sbx. O gh ja vem na imagem.
+        git config --global "credential.https://github.com.helper" "!gh auth git-credential"
+        gh config set --host github.com git_protocol https
       user: "1000"
-      description: Identidade git e glab apontando para o GitLab de trabalho
+      description: Identidade git, glab e gh apontando para o GitLab de trabalho e o GitHub
 
   files:
     - path: /home/agent/.local/bin/copy-from-host.sh
@@ -278,7 +288,169 @@ setup:
           fi
         done
 
+    - path: /home/agent/.local/bin/clone-multi-repo.sh
+      mode: "0755"
+      description: Clona os subrepos de uma pasta multi-repo do host no workspace
+      content: |
+        #!/bin/sh
+        # Modo multi-repo: o --clone do sbx clona so o workspace primario. Aqui a
+        # pasta do host (KIT_MULTI_REPO_SOURCE) fica montada read-only, e o
+        # workspace primario e uma pasta vazia e gravavel.
+        # Para cada subrepo: git clone, branches locais do host, remotes do host e
+        # o upstream de cada branch. Arquivos soltos da pasta sao copiados.
+        # Idempotente: nada que ja existe no workspace e sobrescrito.
+        #
+        # O .git/config da origem nao e confiavel. Nada dele e copiado em bloco:
+        # so nomes e valores que passam pela allowlist chegam ao clone.
+        SRC="$KIT_MULTI_REPO_SOURCE"
+        [ -n "$SRC" ] || exit 0
+        if [ ! -d "$SRC" ]; then
+          echo "[multi-repo] $SRC ausente no sandbox; monte com '$SRC:ro'" >&2
+          exit 1
+        fi
+        SRC=$(realpath "$SRC") || exit 1
+        WS=$(realpath "${WORKDIR}") || exit 1
+        case "$WS/" in
+          "$SRC"/*) echo "[multi-repo] o workspace $WS fica dentro de $SRC; recusado" >&2; exit 1 ;;
+        esac
+
+        # Nome de remote: letras, numeros, . _ -. Nada de - no inicio.
+        valid_remote() {
+          case "$1" in
+            ''|-*|*[!A-Za-z0-9._-]*) return 1 ;;
+          esac
+        }
+
+        # Branch ou ref: como valid_remote, mais /, e sem "..".
+        valid_ref() {
+          case "$1" in
+            ''|-*|*..*|*[!A-Za-z0-9._/-]*) return 1 ;;
+          esac
+        }
+
+        # Remote de caminho local fica de fora, como no --clone.
+        valid_url() {
+          case "$1" in
+            *[[:space:]]*) return 1 ;;
+            https://*|ssh://*|git@*:*) return 0 ;;
+          esac
+          return 1
+        }
+
+        # git na origem: o mount pode chegar com outro dono, entao safe.directory vale
+        # so para aquele repo. fsmonitor e hooks da origem ficam desligados.
+        git_src() {
+          git -c safe.directory="$src" -c core.fsmonitor=false -c core.hooksPath=/dev/null "$@"
+        }
+
+        # Fica dentro de $2? Resolve symlinks e .. antes de comparar.
+        inside() {
+          real=$(realpath -m "$1" 2>/dev/null) || return 1
+          case "$real/" in
+            "$2"/*) return 0 ;;
+          esac
+          return 1
+        }
+
+        # Clona em "$dest.tmp" e so renomeia no fim: um clone interrompido nunca
+        # ocupa o nome final, e o proximo start tenta de novo.
+        clone_repo() {
+          if do_clone "$1" "$2.tmp" "$3"; then
+            mv "$2.tmp" "$2"
+          else
+            rm -rf "$2.tmp"
+            return 1
+          fi
+        }
+
+        do_clone() {
+          src=$1
+          dest=$2
+          name=$3
+          rm -rf "$dest"
+          git_src clone --quiet --no-hardlinks -- "$src" "$dest" || return 1
+          git_src -C "$dest" fetch --quiet --update-head-ok "$src" '+refs/heads/*:refs/heads/*' || return 1
+          # O origin do clone aponta para o caminho local. Troca pelos remotes do host.
+          git -C "$dest" remote remove origin || return 1
+          git_src -C "$src" remote | while read -r r; do
+            if ! valid_remote "$r"; then
+              echo "[multi-repo] $name: remote ignorado (nome invalido)"
+              continue
+            fi
+            # config --get le a URL crua, sem aplicar o url.*.insteadOf da origem.
+            url=$(git_src -C "$src" config --get "remote.$r.url") || continue
+            if ! valid_url "$url"; then
+              echo "[multi-repo] $name: remote ignorado (URL local ou fora da allowlist): $r"
+              continue
+            fi
+            git -C "$dest" remote add -- "$r" "$url" || exit 1
+            git_src -C "$dest" fetch --quiet "$src" "+refs/remotes/$r/*:refs/remotes/$r/*" || exit 1
+          done || return 1
+          # Upstream por branch: remote so se foi copiado acima, merge so refs/heads/.
+          git -C "$dest" for-each-ref --format='%(refname:short)' refs/heads | while read -r b; do
+            valid_ref "$b" || continue
+            remote=$(git_src -C "$src" config --get "branch.$b.remote") || continue
+            merge=$(git_src -C "$src" config --get "branch.$b.merge") || continue
+            valid_remote "$remote" && git -C "$dest" remote get-url -- "$remote" >/dev/null 2>&1 || continue
+            case "$merge" in refs/heads/*) ;; *) continue ;; esac
+            valid_ref "$merge" || continue
+            git -C "$dest" config "branch.$b.remote" "$remote" || exit 1
+            git -C "$dest" config "branch.$b.merge" "$merge" || exit 1
+          done || return 1
+          # Itens de copy_from_host: sem .., sem caminho absoluto, e origem e destino
+          # dentro do repo depois de resolver symlinks.
+          destreal=$(realpath "$dest") || return 1
+          set -f
+          IFS=,
+          # sh nao tem local: nome proprio para nao pisar no item do loop principal.
+          for ignored in $KIT_COPY_FROM_HOST; do
+            case "$ignored" in
+              '') continue ;;
+              /*|..|../*|*/..|*/../*)
+                echo "[multi-repo] $name: copy_from_host recusado: $ignored"
+                continue ;;
+            esac
+            [ -e "$src/$ignored" ] || continue
+            [ -e "$dest/$ignored" ] || [ -L "$dest/$ignored" ] && continue
+            if inside "$src/$ignored" "$src" && inside "$(dirname "$dest/$ignored")" "$destreal"; then
+              cp -a "$src/$ignored" "$dest/$ignored" && echo "[multi-repo] copiado: $name/$ignored"
+            else
+              echo "[multi-repo] $name: copy_from_host recusado (symlink para fora): $ignored"
+            fi
+          done
+          unset IFS
+          set +f
+        }
+
+        status=0
+        for entry in "$SRC"/* "$SRC"/.[!.]*; do
+          [ -e "$entry" ] || [ -L "$entry" ] || continue
+          item=$(basename "$entry")
+          [ "$item" = .git ] && continue
+          if [ -e "$WS/$item" ] || [ -L "$WS/$item" ]; then
+            echo "[multi-repo] ja existe no workspace, mantido: $item"
+          elif [ -L "$entry" ]; then
+            # Symlink de topo aponta para fora da pasta: nao entra no workspace.
+            echo "[multi-repo] symlink ignorado: $item"
+          elif [ -d "$entry/.git" ]; then
+            if clone_repo "$entry" "$WS/$item" "$item"; then
+              echo "[multi-repo] clonado: $item"
+            else
+              echo "[multi-repo] falha ao clonar: $item" >&2
+              status=1
+            fi
+          elif cp -a "$entry" "$WS/$item"; then
+            echo "[multi-repo] copiado: $item"
+          else
+            echo "[multi-repo] falha ao copiar: $item" >&2
+            status=1
+          fi
+        done
+        exit $status
   startup:
     - command: ["/home/agent/.local/bin/copy-from-host.sh"]
       user: "1000"
       description: Copiar arquivos ignorados pelo git, se copy_from_host pedir
+    - command: ["/home/agent/.local/bin/clone-multi-repo.sh"]
+      user: "1000"
+      description: Clonar os subrepos, se multi_repo_source pedir
