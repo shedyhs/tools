@@ -1,9 +1,9 @@
 schemaVersion: "2"
 kind: sandbox
 name: config-ecc
-version: "0.4.0"
-displayName: Claude Code + ECC seletivo + glab + roteador de modelos + mods
-description: Claude Code com ECC seletivo (skills curadas, agentes, comandos e rules), hooks do ECC ativos, glab configurado, roteador de modelos (Jev/TypeSafe) com painel /router, plugins e mods do host e skills de escrita STE
+version: "0.5.0"
+displayName: Claude Code + ECC seletivo + glab + Jev (mod) + mods
+description: Claude Code com ECC seletivo (skills curadas, agentes, comandos e rules), hooks do ECC ativos, glab configurado, mod jev-model-router (Jev/TypeSafe) para escolher modelo e esforco, plugins e mods do host e skills de escrita STE
 extends: claude
 sourceURL: https://github.com/affaan-m/ECC
 licenses:
@@ -60,12 +60,8 @@ args:
     pattern: '([a-z0-9][a-z0-9:_-]*(,[a-z0-9][a-z0-9:_-]*)*)?'
   model_router:
     default: "on"
-    description: Roteador de modelos (o Jev, da TypeSafe, escolhe modelo e esforco). Precisa do secret TYPESAFE_API_KEY. Sem ele, o Claude roda direto
+    description: Mod jev-model-router (o Jev, da TypeSafe, escolhe modelo e esforco). Precisa do secret TYPESAFE_API_KEY. Sem chave, o mod sai do sandbox e o Claude roda direto
     enum: ["on", "off"]
-  router_confidence_min:
-    default: "0.5"
-    description: Confianca minima do Jev (ROUTER_CONFIDENCE_MIN). Abaixo dela, o roteador usa o menor modelo que soma 80% da probabilidade
-    pattern: '^(0(\.[0-9]+)?|1(\.0+)?)$'
 
 environment:
   variables:
@@ -77,16 +73,12 @@ environment:
     KIT_COPY_FROM_HOST: "${{ kit.args.copy_from_host }}"
     KIT_MULTI_REPO_SOURCE: "${{ kit.args.multi_repo_source }}"
     KIT_MODEL_ROUTER: "${{ kit.args.model_router }}"
-    ROUTER_CONFIDENCE_MIN: "${{ kit.args.router_confidence_min }}"
     # O sandbox nao tem journald: o roteador grava o log aqui e o --stats le daqui.
     ROUTER_LOG_FILE: /home/agent/.local/state/claude-model-router/router.log
     # Os mods com painel (hooks modules) ainda sao early access no Claude Code do sandbox.
     CLAUDE_CODE_ENABLE_FUNCTION_HOOKS: "1"
 
 sandbox:
-  # Sobe o roteador (se ligado e com chave) e roda o claude. Veja o script.
-  entrypoint:
-    - /home/agent/.local/bin/claude-routed
   command:
     - --dangerously-skip-permissions
     - --settings
@@ -105,8 +97,6 @@ permissions:
       - "deb.debian.org:443"                   # update do debian quando levanta o container
       - "*.npmjs.org:443"
       - "api.typesafe.ai:443"                  # Jev (roteador de modelos)
-      - "pypi.org:443"                         # deps do claude-model-router (uv)
-      - "files.pythonhosted.org:443"
       - "${{ kit.args.gitlab_host }}:443"      # GitLab de trabalho
 
 setup:
@@ -208,14 +198,6 @@ setup:
         npm install --omit=dev --no-audit --no-fund --loglevel=error
       user: "1000"
       description: Dependencias da skill qrcode-otp
-
-    - command: |
-        set -eu
-        chmod 0755 /home/agent/.local/bin/claude-model-router /home/agent/.local/bin/claude-routed
-        [ "$KIT_MODEL_ROUTER" = on ] || exit 0
-        uv run --locked --script /home/agent/.local/bin/claude-model-router --selftest
-      user: "1000"
-      description: Preparar o claude-model-router (deps fixadas pelo lockfile, no cache do uv, e selftest)
 
     - command: |
         set -eu
@@ -447,6 +429,36 @@ setup:
           fi
         done
         exit $status
+    - path: /home/agent/.local/bin/jev-config.sh
+      mode: "0755"
+      description: Liga o mod jev-model-router so com KIT_MODEL_ROUTER=on e chave; senao remove a copia
+      content: |
+        #!/bin/sh
+        # O mod le a chave das opcoes do plugin (pluginConfigs em ecc.json). A env
+        # TYPESAFE_API_KEY e o placeholder do sbx: o proxy troca pela chave real.
+        # Sem ligar ou sem chave, a pasta do mod sai do sandbox e o Claude roda sem ele.
+        set -eu
+        MOD=/home/agent/.local/share/claude-plugins/jev-model-router
+        CFG=/home/agent/.config/claude/ecc.json
+        if [ "$KIT_MODEL_ROUTER" != on ] || [ -z "${TYPESAFE_API_KEY:-}" ]; then
+          rm -rf "$MOD"
+          KEY="" CFG="$CFG" node -e '
+            const fs = require("fs");
+            const cfg = JSON.parse(fs.readFileSync(process.env.CFG, "utf8"));
+            delete cfg.pluginConfigs;
+            fs.writeFileSync(process.env.CFG, JSON.stringify(cfg, null, 2));
+          '
+          echo "[jev] mod desligado (model_router=$KIT_MODEL_ROUTER)"
+          exit 0
+        fi
+        KEY="$TYPESAFE_API_KEY" CFG="$CFG" node -e '
+          const fs = require("fs");
+          const cfg = JSON.parse(fs.readFileSync(process.env.CFG, "utf8"));
+          cfg.pluginConfigs = { "jev-model-router": { options: { typesafeApiKey: process.env.KEY } } };
+          fs.writeFileSync(process.env.CFG, JSON.stringify(cfg, null, 2));
+        '
+        echo "[jev] mod ligado com a chave do placeholder"
+
   startup:
     - command: ["/home/agent/.local/bin/copy-from-host.sh"]
       user: "1000"
@@ -454,3 +466,6 @@ setup:
     - command: ["/home/agent/.local/bin/clone-multi-repo.sh"]
       user: "1000"
       description: Clonar os subrepos, se multi_repo_source pedir
+    - command: ["/home/agent/.local/bin/jev-config.sh"]
+      user: "1000"
+      description: Ligar ou desligar o mod jev-model-router conforme model_router e a chave

@@ -2,8 +2,8 @@
 
 Sandbox kit do `sbx` que sobe o Claude Code com um **ECC seletivo** (lista curada
 de skills + agentes + comandos), os **hooks do ECC ativos** e o **glab** pronto
-para o GitLab da PMMT. Desde a versão 0.2.0, o kit também traz o **roteador de
-modelos** (o Jev escolhe modelo e esforço) e as **regras
+para o GitLab da PMMT. Desde a versão 0.2.0, o kit também traz o **mod
+jev-model-router** (o Jev escolhe modelo e esforço) e as **regras
 de escrita técnica** (STE e português técnico simplificado). Desde a 0.3.0, o
 kit traz os **plugins e mods do host** (ponytail, i-have-adhd, answer-pane,
 context-bar, output-diet, skill-diet), fixa o Claude Code na versão do host e usa
@@ -90,10 +90,10 @@ token do GitLab. A chave fica no host, e o container só vê um placeholder:
 
 ```bash
 sbx secret set-custom --host api.typesafe.ai --env TYPESAFE_API_KEY \
-  --value "$(sed -n 's/^TYPESAFE_API_KEY=//p' ~/.config/claude-model-router/env)"
+  --value "$(jq -r '.pluginConfigs["jev-model-router@skills-dir"].options.typesafeApiKey' ~/.claude/settings.json)"
 ```
 
-Sem esse secret, o sandbox sobe normalmente e o Claude roda sem roteador.
+Sem esse secret, o mod sai do sandbox e o Claude roda sem ele.
 
 ## Quais skills entram
 
@@ -153,8 +153,7 @@ worktrees, sessões paralelas) — ambos na lista.
 | `copy_from_host` | *(vazio)* | lista por vírgula | Arquivos ignorados pelo git a copiar do repo do host (com `--clone` ou `multi_repo_source`) |
 | `multi_repo_source` | *(vazio)* | caminho absoluto | Pasta do host com vários repos. O startup clona cada subrepo no workspace (veja [Vários repos no mesmo sandbox](#vários-repos-no-mesmo-sandbox)) |
 | `disabled_hooks` | *(vazio)* | IDs minúsculos por vírgula | `ECC_DISABLED_HOOKS` |
-| `model_router` | `on` | `on`, `off` | Liga o roteador de modelos (precisa do secret `TYPESAFE_API_KEY`) |
-| `router_confidence_min` | `0.5` | número de 0 a 1 | `ROUTER_CONFIDENCE_MIN`: abaixo dela, o roteador usa o menor modelo que soma 80% da probabilidade |
+| `model_router` | `on` | `on`, `off` | Liga o mod `jev-model-router` (precisa do secret `TYPESAFE_API_KEY`) |
 
 Todo arg interpolado em comando tem `enum` ou `pattern` — a substituição
 `${{ kit.args.X }}` é textual e roda antes do parse do YAML, então a restrição é
@@ -179,8 +178,9 @@ o que impede injeção de shell no `setup.install`.
 5. **Identidade git** — sem ela o `git commit` falha, e o sandbox vem sem.
 6. **Auth GitLab por HTTPS** via `glab auth git-credential` como credential
    helper.
-7. **Roteador de modelos** (`~/.local/bin/claude-model-router`), iniciado pelo
-   entrypoint `claude-routed`. Veja [Roteador de modelos](#roteador-de-modelos).
+7. **Mod jev-model-router** em `~/.local/share/claude-plugins/jev-model-router`.
+   O `jev-config.sh` grava a chave no `ecc.json` na partida, ou remove a pasta
+   quando o mod está desligado. Veja [Roteador de modelos](#roteador-de-modelos).
 8. **Escrita técnica:** as skills `asd-ste100` e `portugues-tecnico-simplificado`
    e a seção de escrita do `CLAUDE.md`. O idioma do Claude fica em `pt-BR`
    (`language` no `ecc.json`).
@@ -193,8 +193,8 @@ o que impede injeção de shell no `setup.install`.
 10. **Skills extras do host:** `archify`, `archify-review`,
     `logging-best-practices` e `migrar-app-entre-namespaces`. A
     `create-sbx-kit` fica de fora: o `sbx kit validate` lê `${{ kit.args.<nome> }}`
-    na documentação dela como placeholder e rejeita o kit. A `jev-model-router` é
-    o hook do roteador no host, e o kit já tem o seu.
+    na documentação dela como placeholder e rejeita o kit. A `jev-model-router` não
+    entra nesta lista: o kit a traz como mod, veja [Roteador de modelos](#roteador-de-modelos).
 
 Para atualizar a partir do host, copie de novo os itens 10 e 11 e o
 `statusline-command.sh`, e ajuste `ecc_ref` e `claude_version`. Depois, rode
@@ -226,7 +226,7 @@ O kit entrega `files/home/.claude/CLAUDE.md`, que vira `~/.claude/CLAUDE.md`
 dentro do container — memória de **usuário**, fora do workspace montado. Cobre:
 ECC seletivo e onde estão as coisas, agentes sem prefixo, hooks ativos e como
 desligá-los, git/glab prontos, placeholder do token, a rede restrita e o
-roteador de modelos. No fim, ele traz a seção "Technical Writing: ASD-STE100"
+mod jev-model-router. No fim, ele traz a seção "Technical Writing: ASD-STE100"
 copiada do `~/.claude/CLAUDE.md` do host, com a parte de pt-BR.
 
 Editar o conteúdo é editar esse arquivo no kit. Duas coisas a lembrar:
@@ -352,43 +352,55 @@ repo sujo. Em trabalho exploratório isso pode incomodar — nesse caso,
 
 ## Roteador de modelos
 
-O kit traz o `claude-model-router`. Os fontes do roteador saíram de `model-router/` em um commit posterior, e o histórico do git ainda os tem (`760a1ba`).
-A cada mensagem sua, o Jev (TypeSafe) escolhe o modelo (Haiku, Sonnet ou Opus) e
-o esforço (`low` a `max`). O Jev também vê o fim da conversa anterior. Com dúvida,
-o roteador usa o menor modelo que soma 80% da probabilidade. Com falha da TypeSafe,
-ele usa opus e `high`. Detalhes no README do roteador, em `760a1ba:model-router/README.md`.
+O kit traz o mod `jev-model-router` (versão 0.4.2, copiada do host). Ele roda
+dentro do Claude Code e consulta o Jev, o modelo de decisão da TypeSafe, pela
+API `api.typesafe.ai`. A cada mensagem, o Jev escolhe o modelo (Haiku, Sonnet ou
+Opus) e o esforço (`low` a `max`). Com dúvida, o mod usa o menor modelo que soma
+80% da probabilidade. Se a TypeSafe falhar, o mod deixa a requisição seguir como
+o motor a montou.
 
-```
-claude -> claude-model-router (127.0.0.1:8788) -> proxy do sbx -> api.anthropic.com
-                       \-> proxy do sbx -> api.typesafe.ai (Jev)
-```
+Por padrão o mod troca o esforço da conversa principal e o modelo de cada
+subagente. A troca de modelo da conversa principal fica desligada, porque ela
+invalida o cache de prompt. Essas opções são do próprio mod, em `pluginConfigs`.
 
-O entrypoint do sandbox é `~/.local/bin/claude-routed`, e não o `claude`:
+Como o kit liga o mod:
 
-1. Se `model_router=on` e `TYPESAFE_API_KEY` existe, o script sobe o roteador.
-2. O script espera até 15 s por `GET /_router/health`.
-3. Se o roteador responde, o script define `ANTHROPIC_BASE_URL` e roda o Claude.
-4. Se algo falha, o script avisa em stderr e roda o Claude direto. O roteador
-   nunca impede a sessão de subir.
+1. No `setup.files`, a pasta do mod vai para `~/.local/share/claude-plugins/`. A
+   pasta é carregada pelo `--plugin-dir` do sbx, como os outros mods.
+2. No `setup.startup`, `jev-config.sh` roda a cada partida:
+   - Se `model_router=on` e `TYPESAFE_API_KEY` existe, ele grava
+     `pluginConfigs["jev-model-router"].options.typesafeApiKey` em
+     `~/.config/claude/ecc.json`.
+   - Senão, apaga a pasta do mod e remove `pluginConfigs` do `ecc.json`. O
+     Claude roda sem o mod.
+3. A chave gravada é o placeholder `sbx-cs-…`, não o valor real. O proxy do sbx
+   troca o placeholder pela chave real na requisição a `api.typesafe.ai`.
+
+O `ecc.json` não guarda segredo real. Ele é regravado a cada partida.
 
 Diferenças em relação ao host:
 
-- O sandbox não tem headroom. O Claude fala direto com o roteador.
-- O sandbox não tem journald. O roteador grava o log em
-  `~/.local/state/claude-model-router/router.log` (`ROUTER_LOG_FILE`), e o
-  `--stats` lê esse arquivo. A pasta tem permissão 700 e o arquivo 600, porque o
-  log guarda o começo de cada prompt. Erros de inicialização vão para
-  `router.err`, na mesma pasta.
-- O roteador manda as requisições pelo proxy do sandbox (`HTTPS_PROXY`). O proxy
-  troca o placeholder de `TYPESAFE_API_KEY` pela chave real.
-- O `setup.install` roda o `--selftest` do roteador. Isso baixa o `aiohttp` do
-  PyPI para o cache do `uv`, e por isso `pypi.org` e `files.pythonhosted.org`
-  estão liberados na rede. As versões e os hashes vêm do lockfile
-  `claude-model-router.lock`, e o `uv run --locked` recusa qualquer diferença.
+- No host, o mod é o `jev-model-router@skills-dir`, lido de
+  `~/.claude/skills/jev-model-router/`. No sandbox, a cópia fica em
+  `~/.local/share/claude-plugins/` e a chave vem do `ecc.json`.
+- No host, o mod é `jev-model-router@skills-dir`. No sandbox, a chave fica em
+  `pluginConfigs["jev-model-router"]`, porque o `--plugin-dir` carrega o mod
+  com essa chave.
+- Não há mais proxy local nem `ANTHROPIC_BASE_URL`. O Claude fala direto com a
+  Anthropic, e o mod chama o Jev sozinho.
 
-O script e o lockfile do kit são cópias das versões de `760a1ba:model-router/`. Se você mudar o
-script, rode `uv lock --script claude-model-router`, copie os dois arquivos para
-`files/home/.local/bin/` e confira com `cmp`.
+Teste de 0.5.0, com sandbox descartável (já removido):
+
+- `claude plugin validate` passou. O mod registra `prompt.submit`, `turn.step` e
+  `agent.spawn`.
+- `claude -p` respondeu `ok` com exit 0.
+- O log de rede do `sbx` mostrou uma chamada a `api.typesafe.ai:443`, pelo
+  proxy.
+- Uma requisição a `api.typesafe.ai/v1/systemone` com o placeholder devolveu
+  422 (erro de formato do meu corpo vazio), e não 401. O proxy aceitou a
+  autenticação.
+- Não confirmei a decisão do Jev dentro de uma sessão interativa. O `claude -p`
+  não mostra o log do mod.
 
 ## Mods com painel
 
@@ -452,9 +464,7 @@ allow:
   - "api.github.com:443"       # API do gh
   - "gitlab.com:443"           # release do glab
   - "gitlab.example.com:443"  # GitLab de trabalho (arg gitlab_host)
-  - "api.typesafe.ai:443"     # Jev (roteador de modelos)
-  - "pypi.org:443"            # aiohttp do roteador, no setup.install
-  - "files.pythonhosted.org:443"
+  - "api.typesafe.ai:443"     # Jev (mod jev-model-router)
 ```
 
 `github.com:443` basta para o clone (testado sem `codeload` e
@@ -481,10 +491,10 @@ proxy sem CA interna. As permissões do agente `claude` pai são herdadas.
   `~/.claude/CLAUDE.md` via `files/home/`, não via `agentInstructions` — que num
   sandbox kit viraria arquivo dentro do workspace montado do host.
 
-- **Entrypoint próprio para o roteador, não `setup.startup`.** O `startup` não
-  segura o entrypoint, então o Claude poderia subir antes do roteador e falhar
-  na primeira requisição. O `claude-routed` espera o roteador responder e, se
-  ele não responde, roda o Claude sem roteador.
+- **Mod em vez de proxy.** Até a 0.4.0, o kit subia o `claude-model-router` como
+  proxy local, com entrypoint `claude-routed`. Desde a 0.5.0, o mod roda dentro
+  do Claude Code, sem processo extra, sem `uv` e sem `pypi.org`. O entrypoint
+  voltou ao padrão do agente `claude`.
 
 ## Verificado
 
@@ -509,7 +519,7 @@ Sandbox criado do zero, `sbx v0.42.1`:
 - workspace montado intacto; SSH agent do host é encaminhado
   (`SSH_AUTH_SOCK=/run/ssh-agent.sock`).
 
-Roteador e painel, sandbox criado do zero com `sbx v0.46.0` (Claude Code
+Roteador e painel (até a 0.4.0, com o `claude-model-router`), sandbox criado do zero com `sbx v0.46.0` (Claude Code
 2.1.280):
 
 - `sbx kit validate` aprova o kit, e o `--selftest` do roteador passa no
@@ -565,9 +575,6 @@ Roteador e painel, sandbox criado do zero com `sbx v0.46.0` (Claude Code
   que gera `claude-ecc:latest`.
 - Os plugins são uma cópia fixa. Uma atualização no host não chega ao kit até
   você copiar de novo (veja o fim de [O que o kit entrega](#o-que-o-kit-entrega)).
-- **Jev com a chave real não foi testado no sandbox.** O teste usou uma chave
-  falsa. A troca do placeholder pelo proxy é o mesmo mecanismo do
-  `GITLAB_TOKEN`, que foi verificado.
 - Os mods com painel são early access no Claude Code. Uma versão nova pode mudar
   a API ou dispensar `CLAUDE_CODE_ENABLE_FUNCTION_HOOKS`.
 - **O painel dos mods novos não foi visto na tela do sandbox.** O teste da 0.3.0
