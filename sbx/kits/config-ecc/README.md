@@ -7,28 +7,64 @@ modelos** (o Jev escolhe modelo e esforço) e as **regras
 de escrita técnica** (STE e português técnico simplificado). Desde a 0.3.0, o
 kit traz os **plugins e mods do host** (ponytail, i-have-adhd, answer-pane,
 context-bar, output-diet, skill-diet), fixa o Claude Code na versão do host e usa
-o ECC 2.2.3.
+o ECC 2.2.3. Desde a 0.4.0, o kit também clona vários repositórios de uma pasta
+no mesmo sandbox (veja [Vários repos no mesmo sandbox](#vários-repos-no-mesmo-sandbox)).
 
 ## Uso
 
 Os defaults do kit são neutros: identidade git vazia e `gitlab.com` como host.
-Os valores da sua máquina entram na invocação — a função de shell abaixo os
-busca a cada run:
+Os valores da sua máquina entram na invocação. A função abaixo fica no
+`~/.zshrc` e busca esses valores a cada run:
 
-```bash
+```zsh
 sbxecc() {
-  local host
-  host=$(git config --get remote.origin.url 2>/dev/null \
+  local kit=/home/shedy/tools/sbx/kits/config-ecc
+  local host name repo=. ws pg=~/.config/pg-mcp/connections.json
+  local -a rest subrepos paths
+  subrepos=( */.git(N/:h) )   # so .git pasta: o script do kit tambem exige -d
+  if ! git rev-parse --is-inside-work-tree >/dev/null 2>&1 && (( $#subrepos )); then
+    repo=$subrepos[1]
+  fi
+  host=$(git -C "$repo" config --get remote.origin.url 2>/dev/null \
     | sed -E 's#^[a-z]+://([^/@]*@)?([^/:]+).*#\2#; s#^[^@]+@([^:]+):.*#\1#')
-  sbx run /caminho/do/kit \
-    --kit-arg git_user_name="$(git config --global user.name)" \
-    --kit-arg git_user_email="$(git config --global user.email)" \
-    --kit-arg gitlab_host="${host:-gitlab.com}" \
-    "$@"
+  rest=()
+  while (( $# )); do
+    case "$1" in
+      --name)   name="$2"; shift 2 ;;
+      --name=*) name="${1#--name=}"; shift ;;
+      *)        rest+=("$1"); shift ;;
+    esac
+  done
+  : ${name:=ecc-${PWD:t}}
+  if [[ $repo != . ]]; then
+    ws=~/.local/share/sbxecc/$name
+    # --clone exige repo no workspace primario, e o "." vira o mount read-only.
+    rest=( ${rest:#--clone} )
+    # (b) escapa [ * ? do caminho; a barra final tambem conta como o mesmo caminho.
+    rest=( ${${${${rest:#.}:#./}:#${(b)PWD}}:#${(b)PWD}/} )
+    paths=( "$ws" "${PWD}:ro" )   # chaves: "$PWD:r" seria modificador do zsh
+    rest=( --kit-arg multi_repo_source="$PWD" "${rest[@]}" )
+    print -r -- "[sbxecc] multi-repo: ${(j:, :)subrepos} -> $ws"
+  fi
+  if ! sbx ls 2>/dev/null | awk '{print $1}' | grep -qx "$name"; then
+    [[ -n $ws ]] && { mkdir -p "$ws" || return 1; }
+    sbx create --name "$name" "$kit" "${paths[@]}" \
+      --kit-arg git_user_name="$(git config --global user.name)" \
+      --kit-arg git_user_email="$(git config --global user.email)" \
+      --kit-arg gitlab_host="${host:-gitlab.com}" \
+      "${rest[@]}" || return 1
+    if [[ -f $pg ]]; then
+      sbx exec "$name" mkdir -p /home/agent/.config/pg-mcp
+      sbx cp "$pg" "$name:/home/agent/.config/pg-mcp/connections.json" \
+        && print -r -- "[sbxecc] pg-mcp connections.json copiado para $name"
+    fi
+  fi
+  sbx run --name "$name"
 }
 ```
 
-`gitlab_host` sai do `origin` do repositório onde você está. Sem identidade, o
+`gitlab_host` sai do `origin` do repositório onde você está. Em uma pasta que
+não é repo, mas tem subrepos, ele sai do primeiro subrepo. Sem identidade, o
 `setup.install` avisa em stderr que `git commit` vai falhar — e segue, porque
 nem todo uso precisa commitar.
 
@@ -114,7 +150,8 @@ worktrees, sessões paralelas) — ambos na lista.
 | `git_user_name` | *(vazio)* | texto | `git config --global user.name` |
 | `git_user_email` | *(vazio)* | e-mail | `git config --global user.email` |
 | `dirty_guard` | `block` | `off`, `warn`, `block` | O que fazer com trabalho não commitado ao encerrar |
-| `copy_from_host` | *(vazio)* | lista por vírgula | Arquivos ignorados pelo git a copiar do repo do host (só com `--clone`) |
+| `copy_from_host` | *(vazio)* | lista por vírgula | Arquivos ignorados pelo git a copiar do repo do host (com `--clone` ou `multi_repo_source`) |
+| `multi_repo_source` | *(vazio)* | caminho absoluto | Pasta do host com vários repos. O startup clona cada subrepo no workspace (veja [Vários repos no mesmo sandbox](#vários-repos-no-mesmo-sandbox)) |
 | `disabled_hooks` | *(vazio)* | IDs minúsculos por vírgula | `ECC_DISABLED_HOOKS` |
 | `model_router` | `on` | `on`, `off` | Liga o roteador de modelos (precisa do secret `TYPESAFE_API_KEY`) |
 | `router_confidence_min` | `0.5` | número de 0 a 1 | `ROUTER_CONFIDENCE_MIN`: abaixo dela, o roteador usa o menor modelo que soma 80% da probabilidade |
@@ -225,6 +262,69 @@ veja antes se um `.env.test` versionado já resolve.
 
 Ressalva: `setup.startup` não segura o entrypoint — o agente pode subir uma
 fração de segundo antes do arquivo aterrissar.
+
+## Vários repos no mesmo sandbox
+
+O `--clone` do sbx clona só o workspace primário, e ele precisa ser um repo git.
+Os workspaces extras sempre entram como bind mount, também no `sbxenv.yaml`.
+Para uma pasta como `~/git/seamme` (sem `.git`, com `back/`, `front/` e
+`external-penha-api/` dentro), o kit faz o clone ele mesmo:
+
+```bash
+cd ~/git/seamme && sbxecc --kit-arg copy_from_host=.env .
+```
+
+O `sbxecc` detecta o caso: a pasta atual não é repo, mas tem subrepos. Então ele:
+
+1. Usa `~/.local/share/sbxecc/<nome>` como workspace primário (vazio e gravável).
+2. Monta a pasta atual como read-only.
+3. Passa `--kit-arg multi_repo_source=<pasta>` e remove o `--clone` e o `.`.
+
+No startup, o `clone-multi-repo.sh` faz isto para cada subrepo:
+
+- `git clone` com todas as branches locais do host.
+- Os remotes do host, com as refs de tracking e o upstream de cada branch. Só
+  entram remotes com nome simples (`A-Z a-z 0-9 . _ -`) e URL `https://`,
+  `ssh://` ou `git@host:`. Remote de caminho local fica de fora, como no
+  `--clone`.
+- Os itens de `copy_from_host` de cada repo (ex, `back/.env`).
+
+O `.git/config` da origem não é confiável, e nada dele é copiado em bloco. O
+script lê cada valor com `git config --get` e só grava no clone o que passa
+pela allowlist: a URL do remote e o `remote`/`merge` de cada branch. Com isso,
+um `core.fsmonitor` ou `core.hooksPath` da origem não chega ao clone. Os comandos
+na origem rodam com `safe.directory` só para aquele repo, e com `fsmonitor` e
+hooks desligados. O `.gitconfig` não é alterado.
+
+Itens de `copy_from_host` com `..`, caminho absoluto ou symlink que sai do repo
+são recusados. Symlinks de topo na pasta de origem são ignorados.
+
+Os itens de topo que não são repo (`docker-compose.yml`, CSVs, `.claude/`) são
+copiados por inteiro, inclusive pastas grandes e arquivos sensíveis (`.env`,
+`.npmrc`). Nada que já existe no workspace é sobrescrito.
+
+Cada clone é feito em `<repo>.tmp` e renomeado no fim. Um clone interrompido,
+por exemplo por um `sbx stop`, é refeito no próximo start. O script recusa
+rodar se o workspace ficar dentro da pasta de origem.
+
+⚠️ Não rode git, IDE ou direnv do host em `~/.local/share/sbxecc/<nome>`. O
+agente do sandbox escreve nessa pasta, inclusive em `.git/hooks` e
+`.git/config`. Use só `git fetch <caminho>` a partir do repo do host, como
+mostrado em "Diferenças" abaixo. O fetch não executa hooks nem config do clone.
+
+⚠️ O `setup.startup` não segura o entrypoint. No primeiro start, o agente pode
+abrir enquanto os clones ainda rodam, e a pasta aparece vazia por um tempo. Se
+um clone falhar, o erro só aparece no log do startup. Os remotes copiados mantêm
+a URL do host, inclusive credenciais embutidas (`https://user:token@...`).
+
+Diferenças em relação ao `--clone`:
+
+- Não existe o remote `sandbox-<nome>`. Os clones ficam no host, então o fetch é
+  direto: `git -C ~/git/seamme/back fetch ~/.local/share/sbxecc/ecc-seamme/back`.
+- Os clones sobrevivem ao `sbx rm`. Um `sbxecc` novo com o mesmo nome reaproveita
+  os clones. Para começar do zero, apague `~/.local/share/sbxecc/<nome>`.
+- O dirty-guard olha só o diretório atual do agente, que não é repo. Como os
+  clones ficam no host, trabalho não commitado não se perde com o sandbox.
 
 ## Trabalho não commitado ao encerrar
 
@@ -395,6 +495,31 @@ Roteador e painel, sandbox criado do zero com `sbx v0.46.0` (Claude Code
 - o `policy log` só mostra liberados `api.anthropic.com`, `api.typesafe.ai` e
   `files.pythonhosted.org` para o roteador.
 
+### Multi-repo (0.4.0)
+
+- **Script no host**, contra `~/git/seamme`: três repos clonados, com as
+  branches, os remotes de URL e o upstream de cada branch batendo com o host.
+  Os `.env` de `copy_from_host` foram copiados. Uma segunda execução manteve
+  tudo. Uma fonte ausente saiu com 1, e uma fonte vazia saiu com 0.
+- **Clone interrompido:** uma pasta `<repo>.tmp` deixada para trás foi refeita
+  no start seguinte, e a `.tmp` não ficou no workspace.
+- **Workspace dentro da fonte:** recusado com exit 1.
+- **Repo hostil** (teste com repo montado à mão): um `merge` com `\n` tentando
+  injetar `core.fsmonitor`, remotes de nome `*` e `--upload-pack=...`, URLs
+  `ext::`, `../outro` e `foo/bar`, `insteadOf` e `core.fsmonitor` na origem.
+  Nada disso chegou ao clone. Depois de `git status` e `git fetch` no clone, o
+  arquivo marcador não foi criado. `copy_from_host` recusou `../..`, `/etc/passwd`
+  e dois symlinks para fora do repo. Antes dessa correção, o `core.fsmonitor`
+  chegava ao clone (reproduzido).
+- **Sandbox `shell` descartável** (já removido): o mount `<pasta>:ro` apareceu
+  no mesmo caminho do host, com uid 1000. Escrita nele falhou com
+  `Read-only file system`. O script rodou dentro do sandbox e clonou os três
+  repos, com `git status` batendo com o host.
+- **`sbxecc`** com `sbx` falso: o comando gerado é o esperado nos dois modos.
+  `--clone`, `.`, `./` e o caminho absoluto são removidos do modo multi-repo.
+- **Não testado:** o `sbx run` completo com o kit `config-ecc`, com o agente
+  interativo. O primeiro create ainda não foi feito com este kit.
+
 ## Limitações
 
 - **Agentes perdem o prefixo `ecc:`.** Instalados como agentes de usuário
@@ -418,6 +543,14 @@ Roteador e painel, sandbox criado do zero com `sbx v0.46.0` (Claude Code
 - **O painel dos mods novos não foi visto na tela do sandbox.** O teste da 0.3.0
   confirmou que os 7 plugins carregam (evento `init` do `claude -p`), mas não
   abriu uma sessão interativa autenticada.
+- **Multi-repo sem remote nativo.** Os clones do modo multi-repo ficam no host,
+  em `~/.local/share/sbxecc/<nome>`. Não há remote `sandbox-<nome>`, então o
+  fetch é feito pelo caminho do clone. Veja [Vários repos no mesmo sandbox](#vários-repos-no-mesmo-sandbox).
+- **Multi-repo sem trava no startup.** O agente pode abrir antes de os clones
+  terminarem. Um erro de clone aparece só no log do startup.
+- **Multi-repo sem dirty-guard nos subrepos.** O `dirty-guard` olha só o diretório
+  atual do agente, que não é repo. Trabalho não commitado dos subrepos não é
+  avisado ao encerrar.
 
 ## Referências
 
