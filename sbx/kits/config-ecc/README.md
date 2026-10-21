@@ -415,11 +415,41 @@ o kit instala a versão do arg `claude_version`. O kit define essa variável.
 Alternativa com o token dentro do container:
 `-e GITLAB_TOKEN="$(glab config get token --host gitlab.example.com)"`.
 
+## Autenticação no GitHub
+
+O `gh` já vem na imagem do `sbx` (2.46). O sandbox define `GH_TOKEN` com um
+placeholder (`gho_sbxp…`), e o proxy troca esse valor pelo token real do secret
+`github` do `sbx`. Sem o secret, o placeholder não vale nada: o `gh auth status`
+responde "token inválido". Guarde o secret uma vez, no host:
+
+```bash
+sbx secret set github --command 'gh auth token'
+```
+
+O `--command` não copia o token. O `sbx` roda o `gh auth token` no host quando
+precisa e guarda o resultado em cache. Um `gh auth refresh` no host vale para os
+próximos usos, sem repetir o comando. Para escopo de um sandbox só, acrescente
+`--sandbox <nome>`.
+
+O kit configura o resto no `setup.install`:
+
+- `credential.https://github.com.helper` aponta para `gh auth git-credential`,
+  então `git clone` e `git push` por HTTPS usam o mesmo token.
+- `gh config set git_protocol https` para `github.com`.
+- A rede libera `github.com:443` e `api.github.com:443`.
+
+O token do host é um OAuth com os escopos que você deu ao `gh auth login`
+(`repo`, `workflow` e outros). O agente roda com `--dangerously-skip-permissions`
+e age em seu nome no GitHub. Se quiser menos poder, rode `gh auth login` no host
+com um token de escopo menor, ou guarde um PAT fino com
+`echo "$PAT" | sbx secret set github`.
+
 ## Rede
 
 ```yaml
 allow:
-  - "github.com:443"           # clone do ECC
+  - "github.com:443"           # clone do ECC, git do gh
+  - "api.github.com:443"       # API do gh
   - "gitlab.com:443"           # release do glab
   - "gitlab.example.com:443"  # GitLab de trabalho (arg gitlab_host)
   - "api.typesafe.ai:443"     # Jev (roteador de modelos)
