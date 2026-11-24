@@ -11,7 +11,8 @@ metadata:
 Conta o tamanho funcional de um sistema e entrega a planilha no formato do modelo de saída
 (`assets/modelo-saida.xlsx`), com a rastreabilidade de cada TD, TR e AR até a fonte.
 
-Base metodológica: os 6 passos do guia FATTO, com tabelas IFPUG. Detalhes em
+Base metodológica: os 6 passos do guia FATTO, com tabelas IFPUG. O guia original está em
+`references/guia-pratico-apf-lopes-braga-2011.pdf` (consulte em caso de dúvida). Resumo em
 `references/metodo-fatto.md`. Para extrair funções de código, DER e telas, siga
 `references/extracao-das-fontes.md`. O formato de entrada do gerador está em
 `references/formato-json.md`.
