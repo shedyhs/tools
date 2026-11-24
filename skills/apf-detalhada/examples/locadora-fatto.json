@@ -1,0 +1,59 @@
+{
+  "_comentario": "Caso da locadora do Guia Prático em APF (Lopes & Braga, 2011). Total esperado: 21 PF de dados + 57 PF de transações = 78 PF. TD/AR copiados das tabelas 2.5 e 2.15 do guia; ar_lista só onde o guia deixa os arquivos evidentes.",
+  "contagem": {
+    "orgao": "Exemplo — Guia FATTO",
+    "unidade": "Locadora de automóveis",
+    "empresa": "Locadora (exemplo)",
+    "aplicacao": "Sistema de locação",
+    "projeto": "Desenvolvimento do sistema de locação",
+    "contado_por": "Claude (skill apf-detalhada)",
+    "tipo_contagem": "desenvolvimento",
+    "data_criacao": "2026-11-24",
+    "proposito": "Teste de regressão da skill: reproduzir a contagem de exemplo do guia FATTO (78 PF).",
+    "escopo": "Aplicação única de locação de automóveis. Sem funções de conversão. VAF = 1."
+  },
+  "funcoes": [
+    {"id": "DAD-01", "nome": "Usuário", "tipo": "ALI", "td": 4, "ar_tr": 1,
+     "td_lista": ["login", "senha", "nome", "perfil"], "tr_lista": ["Usuário"],
+     "fontes": ["Guia FATTO, fig. 2.9 / tab. 2.5"]},
+    {"id": "DAD-02", "nome": "Cliente", "tipo": "ALI", "td": 7, "ar_tr": 2,
+     "td_lista": ["cpf", "nome", "endereço", "telefone", "e-mail", "data_aluguel", "hora_aluguel"],
+     "tr_lista": ["Cliente", "Aluga"], "fontes": ["Guia FATTO, fig. 2.9 / tab. 2.5"],
+     "observacoes": "Aluga é TR: a tabela não é reconhecida pelo negócio, mas data/hora do aluguel são (passo 3a)."},
+    {"id": "DAD-03", "nome": "Carro", "tipo": "ALI", "td": 8, "ar_tr": 2,
+     "td_lista": ["placa", "modelo", "marca", "ano", "cor", "diária", "data_aluguel", "hora_aluguel"],
+     "tr_lista": ["Carro", "Aluga"], "fontes": ["Guia FATTO, fig. 2.9 / tab. 2.5"]},
+
+    {"id": "CLI-T01", "grupo": "Cliente", "nome": "Incluir Cliente", "tipo": "EE", "td": 6, "ar_tr": 1, "ar_lista": ["Cliente"], "mantem": ["Cliente"], "fontes": ["Guia FATTO, tab. 2.15"]},
+    {"id": "CLI-T02", "grupo": "Cliente", "nome": "Excluir Cliente", "tipo": "EE", "td": 3, "ar_tr": 1, "ar_lista": ["Cliente"], "mantem": ["Cliente"], "fontes": ["Guia FATTO, tab. 2.15"]},
+    {"id": "CLI-T03", "grupo": "Cliente", "nome": "Alterar Cliente", "tipo": "EE", "td": 6, "ar_tr": 1, "ar_lista": ["Cliente"], "mantem": ["Cliente"], "fontes": ["Guia FATTO, tab. 2.15"]},
+    {"id": "CLI-T04", "grupo": "Cliente", "nome": "Consulta clientes por nome", "tipo": "CE", "td": 3, "ar_tr": 2, "fontes": ["Guia FATTO, tab. 2.15"]},
+    {"id": "CLI-T05", "grupo": "Cliente", "nome": "Consulta clientes com carro alugado", "tipo": "CE", "td": 6, "ar_tr": 3, "fontes": ["Guia FATTO, tab. 2.15 (a tab. 2.14 traz TD 3; a 2.15 usa 6, que gera Média e fecha os 78 PF)"]},
+    {"id": "CLI-T06", "grupo": "Cliente", "nome": "Consulta cliente que mais aluga", "tipo": "CE", "td": 3, "ar_tr": 2, "fontes": ["Guia FATTO, tab. 2.15"]},
+
+    {"id": "USU-T01", "grupo": "Usuário", "nome": "Incluir Usuário", "tipo": "EE", "td": 3, "ar_tr": 2, "mantem": ["Usuário"], "fontes": ["Guia FATTO, tab. 2.15"]},
+    {"id": "USU-T02", "grupo": "Usuário", "nome": "Excluir Usuário", "tipo": "EE", "td": 3, "ar_tr": 2, "mantem": ["Usuário"], "fontes": ["Guia FATTO, tab. 2.15"]},
+    {"id": "USU-T03", "grupo": "Usuário", "nome": "Alterar Usuário", "tipo": "EE", "td": 3, "ar_tr": 1, "ar_lista": ["Usuário"], "mantem": ["Usuário"], "fontes": ["Guia FATTO, tab. 2.15"]},
+    {"id": "USU-T04", "grupo": "Usuário", "nome": "Login (com criptografia)", "tipo": "SE", "td": 4, "ar_tr": 1, "ar_lista": ["Usuário"], "fontes": ["Guia FATTO, 2.5.2 e tab. 2.15"]},
+
+    {"id": "CAR-T01", "grupo": "Automóveis", "nome": "Incluir Automóveis", "tipo": "EE", "td": 7, "ar_tr": 2, "mantem": ["Carro"], "fontes": ["Guia FATTO, tab. 2.15"]},
+    {"id": "CAR-T02", "grupo": "Automóveis", "nome": "Excluir Automóveis", "tipo": "EE", "td": 3, "ar_tr": 2, "mantem": ["Carro"], "fontes": ["Guia FATTO, tab. 2.15"]},
+    {"id": "CAR-T03", "grupo": "Automóveis", "nome": "Alterar Automóveis", "tipo": "EE", "td": 7, "ar_tr": 1, "ar_lista": ["Carro"], "mantem": ["Carro"], "fontes": ["Guia FATTO, tab. 2.15"]},
+    {"id": "CAR-T04", "grupo": "Automóveis", "nome": "Consulta carros alugados", "tipo": "CE", "td": 3, "ar_tr": 2, "ar_lista": ["Carro", "Cliente"], "fontes": ["Guia FATTO, tab. 2.15"]},
+    {"id": "CAR-T05", "grupo": "Automóveis", "nome": "Consulta carro mais alugado", "tipo": "CE", "td": 3, "ar_tr": 3, "fontes": ["Guia FATTO, tab. 2.15"]},
+
+    {"id": "LOC-T01", "grupo": "Locação", "nome": "Registrar Locação", "tipo": "EE", "td": 3, "ar_tr": 2, "ar_lista": ["Cliente", "Carro"], "mantem": ["Cliente", "Carro"], "fontes": ["Guia FATTO, tab. 2.15"]},
+    {"id": "LOC-T02", "grupo": "Locação", "nome": "Finalizar Locação", "tipo": "EE", "td": 4, "ar_tr": 2, "ar_lista": ["Cliente", "Carro"], "mantem": ["Cliente", "Carro"], "fontes": ["Guia FATTO, tab. 2.15"]},
+    {"id": "LOC-T03", "grupo": "Locação", "nome": "Consulta data do aluguel", "tipo": "CE", "td": 3, "ar_tr": 2, "ar_lista": ["Cliente", "Carro"], "fontes": ["Guia FATTO, tab. 2.15"]},
+
+    {"id": "REL-T01", "grupo": "Relatórios", "nome": "Relatório de faturamento mensal", "tipo": "SE", "td": null, "ar_tr": 2,
+     "pendencia": "Função fictícia para testar o fluxo 'A apurar': o layout do relatório não foi fornecido.", "fontes": ["(teste)"]}
+  ],
+  "evidencias": [
+    {"tipo": "DER", "local": "Modelo lógico: Usuário, Cliente, Carro, Aluga", "funcao": "DAD-01..03", "tratamento": "Aluga → TR de Cliente e de Carro", "fonte": "Guia FATTO, fig. 2.9"}
+  ],
+  "revisao": [
+    {"referencia": "USU-T04", "situacao": "Premissa", "item": "Login classificado como SE (com criptografia), como no guia FATTO.", "decisao": "Pela IFPUG/NESMA, o login costuma não ser contado ou é tratado de outra forma. Confirmar com o contratante.", "fonte": "Guia FATTO 2.5.2"}
+  ],
+  "premissas": ["Exemplo didático: os nomes de TD são ilustrativos, as quantidades são as do guia."]
+}
