@@ -1,6 +1,8 @@
 # Método — Guia Prático em APF (Lopes & Braga, 2011, FATTO)
 
-Fonte: https://www.fattocs.com/wp-content/uploads/2020/04/JhoneySLopes-JoseLBraga-2011.pdf
+Fonte: LOPES, J. S.; BRAGA, J. L. *Guia Prático em Análise de Ponto de Função*. DPI/UFV, 2011.
+Cópia local: `references/guia-pratico-apf-lopes-braga-2011.pdf` (baixada de
+https://www.fattocs.com/wp-content/uploads/2020/04/JhoneySLopes-JoseLBraga-2011.pdf). Direitos dos autores.
 Resumo em palavras próprias. Tabelas = padrão IFPUG reproduzido no guia.
 
 ## Os 6 passos
