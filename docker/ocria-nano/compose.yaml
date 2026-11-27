@@ -1,0 +1,10 @@
+services:
+  ocria:
+    build: .
+    image: ocria-nano:latest
+    container_name: ocria-nano
+    restart: unless-stopped
+    environment:
+      MAX_UPLOAD_MB: "0"        # limite de upload em MB; 0 = sem limite
+    ports:
+      - "127.0.0.1:8000:8000"   # só acessível nesta máquina
